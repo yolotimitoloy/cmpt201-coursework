@@ -1,0 +1,23 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+
+
+int main (int argc, char *argv[]){
+  printf("hello world\n");
+  
+  FILE *stream;
+  char *line = NULL;
+  size_t len = 0;
+  ssize_t nread;
+  stream = fopen(argv[1], "r");
+
+
+  while((nread=getline(&line,&len,stream))!=-1){
+  printf("retrieved line of lenght %zd: \n", nread);
+  fwrite(line,nread,1,stdout);
+  }
+  free(line);
+    fclose(stream);
+exit(EXIT_SUCCESS);
+}

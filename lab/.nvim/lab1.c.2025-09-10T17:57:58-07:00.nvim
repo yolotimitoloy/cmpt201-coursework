@@ -1,0 +1,11 @@
+#include <stdio.h>
+#include <stdlib.h>
+#define _GNU_SOURCE
+
+int main (int argc, char *argv[]){
+  printf("hello world\n");
+  
+  FILE *stream;
+  stream = fopen(argv[1], "r");
+  printf(stream);
+}
