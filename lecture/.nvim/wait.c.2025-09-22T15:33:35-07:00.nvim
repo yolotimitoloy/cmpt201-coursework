@@ -1,0 +1,87 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main() {
+  // failed child
+  pid_t pid = fork();
+  if (pid != 0) {
+    int wstatus = 0;
+    if (waitpid(pid, &wstatus, 0) == -1) {
+      perror("waitpid");
+      exit(EXIT_FAILURE);
+    }
+    if (WIFEXITED(wstatus)) {
+      printf("child done with exit status: %d\n", WEXITSTATUS(wstatus));
+    } else {
+      printf("child did not exit normally\n");
+    }
+
+  } else {
+    if (execlp("/bin/ls", "/bin/ls", "bonkers", "-al", (char *)NULL) == -1) {
+      perror("execl");
+      exit(EXIT_FAILURE);
+    }
+  }
+  // runtime error
+  pid_t pid2 = fork();
+  if (pid2 != 0) {
+    int wstatus = 0;
+    if (waitpid(pid2, &wstatus, 0) == -1) {
+      perror("waitpid");
+      exit(EXIT_FAILURE);
+    }
+    if (WIFEXITED(wstatus)) {
+      printf("child done with exit status: %d\n", WEXITSTATUS(wstatus));
+    } else {
+      printf("child did not exit normally\n");
+    }
+
+  } else {
+    *(volatile int *)NULL;
+    if (execlp("/bin/ls", "/bin/ls", "-al", (char *)NULL) == -1) {
+      perror("execl");
+      exit(EXIT_FAILURE);
+    }
+  }
+  // normal
+  pid_t pid3 = fork();
+  if (pid3 != 0) {
+    int wstatus = 0;
+    if (waitpid(pid3, &wstatus, 0) == -1) {
+      perror("waitpid");
+      exit(EXIT_FAILURE);
+    }
+    if (WIFEXITED(wstatus)) {
+      printf("child done with exit status: %d\n", WEXITSTATUS(wstatus));
+    } else {
+      printf("child did not exit normally\n");
+    }
+
+  } else {
+    if (execlp("/bin/ls", "/bin/ls", "-al", (char *)NULL) == -1) {
+      perror("execl");
+      exit(EXIT_FAILURE);
+    }
+  }
+  // no child
+  pid_t pid4 = fork();
+  if (pid2 != 0) {
+    int wstatus = 0;
+    if (waitpid(pid4, &wstatus, 0) == -1) {
+      perror("waitpid");
+      exit(EXIT_FAILURE);
+    }
+    if (WIFEXITED(wstatus)) {
+      printf("child done with exit status: %d\n", WEXITSTATUS(wstatus));
+    } else {
+      printf("child did not exit normally");
+    }
+
+  } else {
+    if (execlp("/bin/ls", "/bin/ls", "-al", (char *)NULL) == -1) {
+      perror("execl");
+      exit(EXIT_FAILURE);
+    }
+  }
+}

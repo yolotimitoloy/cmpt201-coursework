@@ -1,0 +1,17 @@
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+  // int pid = fork();
+
+  
+  // if (pid == fork()) {
+  printf("%d",getpid());
+  //fork();
+  int temp = fork();
+  if (temp !=0){
+    printf("parent done.\n %d", getppid());
+  } else {
+    printf("child done.\n %d", getpid());
+  }
+}

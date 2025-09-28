@@ -1,0 +1,20 @@
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+  // int pid = fork();
+
+  // if (pid == fork()) {
+  printf("current process ppid = %d \n", getppid());
+  printf("current process pid = %d \n", getpid());
+  // fork();
+  int temp = fork();
+  if (temp != 0) {
+    printf("parent done. ppid = %d \n", getpid());
+    printf("child done. pid = %d \n", temp);
+
+  } else {
+    printf("parent done. ppid = %d \n", getppid());
+    printf("child done. pid = %d \n", getpid());
+  }
+}

@@ -1,0 +1,37 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main() {
+  while(true) {
+    printf("Enter programs to run.\n");
+    printf("> ");
+
+    char *line = NULL;
+    size_t len = 0;
+
+    if ((len = getline(&line, &len, stdin)) != -1) {
+      line[len - 1] = '\0';
+      // printf("command will be: %s\n", line);
+      
+      pid_t pid = fork();
+      if (pid != 0) {
+        pid_t wpid = waitpid(pid, NULL, 0);
+        if (wpid == -1) {
+          printf("ERROR: waiting for PID.\n");
+        }
+      } else {
+        if (execl(line, line, NULL) == -1) {
+          printf("Exec failure\n");
+        }
+      }
+    } else {
+      printf("Getline failed. \n");
+      exit(EXIT_FAILURE);
+    }
+  }
+}

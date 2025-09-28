@@ -1,0 +1,59 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define MAX_LEN 5
+
+char *input[MAX_LEN];
+int history = 0;
+
+void enqueue(char *input);
+void dequeue();
+void print_all();
+char *get_input();
+
+int main() {
+  while (1) {
+    char *input = get_input();
+
+    enqueue(input);
+    if (strcmp(input, "print") == 0) {
+      print_all();
+    }
+  }
+  return 0;
+}
+
+char *get_input() {
+  char *buffer = NULL;
+  size_t buffer_size = 0;
+  printf("enter input: ");
+  size_t len = getline(&buffer, &buffer_size, stdin);
+  if (len == -1) {
+    exit(1);
+  }
+  buffer[len - 1] = '\0';
+  return buffer;
+}
+
+void enqueue(char *input) {
+  if (history > MAX_LEN) {
+    dequeue();
+  }
+  input[history] = input;
+  history++;
+}
+
+void dequeue() {
+  free(input[0]);
+  for (int i = 1; i < history; i++) {
+    input[i - 1] = input[i];
+  }
+  history--;
+}
+
+void print_all() {
+  for (int i = 0; i < history; i++) {
+    printf("%s\n", input[i]);
+  }
+}
