@@ -1,0 +1,78 @@
+#define _DEFAULT_SOURCE
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+struct header {
+  // node
+  uint64_t size;
+  struct header *next;
+};
+
+struct block {
+  int data;
+  struct header head;
+};
+
+void handle_error(const char *msg){
+  perror(msg);
+  exit(EXIT_FAILURE);
+}
+
+
+void initialize_block(struct header *block, uint64_t size, struct header *next, int value) {
+  block->size = size;
+  block->next = next;
+  memset(block + 1, value, size - sizeof(struct header));
+}
+
+void print_out(char *format, void *data, size_t data_size) {
+  char buf[64];
+  ssize_t len = snprintf(buf, 64, format, data_size == sizeof(uint64_t)
+      ? *(uint64_t *)data  
+      : *(void **)data);
+  if (len < 0) {
+    handle_error("snprintf");
+  }
+  write(STDOUT_FILENO, buf, len);
+}
+
+void print_block(char *start){
+  for (int i = 0; i < 128 - sizeof(struct header); ++i){
+    char *address = (start + sizeof(struct header) + i);
+    uint64_t value = (uint64_t)*address;
+    print_out("%lu\n",&value,sizeof(value));
+  }
+}
+
+int main() {
+  char *start = sbrk(0);
+  if (sbrk(256) == (void *)-1){
+    handle_error("sbrk");
+  }
+  
+  struct header *block1 = (struct header *)start;
+  struct header *block2 = (struct header *)(start + 128);
+
+  initialize_block(block1, 128, NULL, 0);
+  initialize_block(block2, 128, block2, 1);
+  
+  printf("first block: %p\n", &block1);
+  printf("second block: %p\n", &block2);
+  printf("first blcok size: %lu\n", &block1->size);
+  printf("second blcok size: %lu\n", &block2->size);
+  printf("first block next: %p\n", &block1->next);
+  printf("second block next: %p\n", &block2->next);
+  print_block((char *) block1);
+  print_block((char *) block2);
+
+
+
+
+
+
+
+}

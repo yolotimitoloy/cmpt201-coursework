@@ -1,0 +1,57 @@
+#define _DEFAULT_SOURCE 
+
+
+#include <stdio.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+struct header {
+  //node
+  uint64_t size;
+  struct header* next;
+};
+
+struct block {
+  int data;
+  struct header head;
+};
+
+void increase_heap_size(int *size){
+  sbrk(size);
+}
+
+void append(struct header **head){
+  if (*head == NULL){
+    *
+  }
+}
+
+struct header *createHead(){
+  struct header *newHead = malloc(
+}
+
+struct block initialize_block(int data){
+  struct header *newHeader = malloc(sbrk(*newHeader));
+}
+
+void print_out(char *format, void *data, size_t data_size) {
+  char buf[BUF_SIZE];
+  ssize_t len = snprintf(buf, BUF_SIZE, format, data_size == sizeof(uint64_t) ? *(uint64_t *)data : *(void **)data);
+  if (len < 0) {
+    handle_error("snprintf");
+  }
+  write(STDOUT_FILENO, buf, len);
+}
+int main() {
+  
+  sbrk(&a);
+  increase_heap_size(256);
+  initialize_block();
+  initialize_block();
+
+
+  print_out();
+}
