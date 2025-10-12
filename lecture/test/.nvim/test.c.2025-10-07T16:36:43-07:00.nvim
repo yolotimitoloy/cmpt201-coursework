@@ -1,0 +1,137 @@
+#define _GNU_SOURCE
+#include "msgs.h"
+#include <limits.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+void phrase(char *input, char **args) {
+  int i = 0;
+  char *token = NULL;
+  char *ptr = NULL;
+  while ((token = strtok_r(input, " \t\n\r", &ptr))) {
+    args[i] = token;
+    i++;
+    input = NULL;
+  }
+  args[i] = NULL;
+}
+void printArgs(char **args) {
+  for (int i = 0; args[i] != NULL; i++) {
+    write(STDOUT_FILENO, args[i], strlen(args[i]));
+    write(STDOUT_FILENO, "\n", 1);
+    args[i] = NULL;
+  }
+}
+char *input_hist[10];
+int hist = 0;
+int count = 0;
+void dequeue() {
+  free(input_hist[0]);
+  for (int i = 1; i < hist; i++) {
+    input_hist[i - 1] = input_hist[i];
+  }
+  hist--;
+}
+
+void enqueue(char *input) {
+  if (hist > 10) {
+    dequeue();
+  }
+  input_hist[hist] = strdup(input);
+  hist++;
+  count++;
+}
+
+char *get_hist(char *input) {
+  if (strcmp(input, "!!") == 0) {
+    return input_hist[hist-1];
+  }
+  char *temp = strdup(input + 1);
+  int check = atoi(temp);
+  if (check == 0 || check > count || check < count - hist) {
+    return NULL;
+  } // print error
+  else {
+    for (int i = 0; i < hist; i++) {
+      if (check == count - i) {
+        return input_hist[i];
+      }
+    }
+  }
+  return NULL;
+}
+
+void print_hist() {
+  for (int i = 0; i < hist; i++) {
+    char counter[10];
+    int temp = count - hist + i + 1;
+    int tempLen = sprintf(counter, "%d: ", temp);
+    write(STDOUT_FILENO, counter, tempLen);
+    write(STDOUT_FILENO, input_hist[i], strlen(input_hist[i]));
+  }
+}
+
+int main() {
+
+  while (true) {
+    char cwd_buffer[4096];
+    char *args[64];
+    char input[4096];
+
+    getcwd(cwd_buffer, sizeof(cwd_buffer));
+    size_t length = strlen(cwd_buffer);
+    write(STDOUT_FILENO, cwd_buffer, length);
+    write(STDOUT_FILENO, "$ ", 2);
+    ssize_t inputLenght = read(STDIN_FILENO, input, sizeof(input) - 1);
+    input[inputLenght] = '\0';
+    //    write(STDOUT_FILENO, input, strlen(input));
+    if (input[0] == '!') {
+      enqueue(get_hist(input));
+    } else {
+      enqueue(input);
+    }
+    phrase(input, args);
+    if (strcmp(args[0], "history") == 0) {
+      print_hist();
+    }
+    if (strcmp(args[0], "exit") == 0) {
+      break;
+    }
+    if (strcmp(args[0], "pwd") == 0) {
+      getcwd(cwd_buffer, sizeof(cwd_buffer));
+      size_t length = strlen(cwd_buffer);
+      write(STDOUT_FILENO, cwd_buffer, length);
+      write(STDOUT_FILENO, "\n", 1);
+    }
+    if (strcmp(args[0], "help") == 0) {
+      if (strcmp(args[1], "help") == 0) {
+        const char *msg = FORMAT_MSG("help", HELP_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "cd") == 0) {
+        const char *msg = FORMAT_MSG("cd", CD_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "exit") == 0) {
+        const char *msg = FORMAT_MSG("exit", EXIT_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "pwd") == 0) {
+        const char *msg = FORMAT_MSG("pwd", PWD_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "history") == 0) {
+        const char *msg = FORMAT_MSG("history", HISTORY_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else {
+        char msg[1024];
+        int len =
+            snprintf(msg, sizeof(msg), "%s: %s\n", args[1], EXTERN_HELP_MSG);
+        write(STDOUT_FILENO, msg, len);
+      }
+    }
+
+    // printArgs(args);
+  }
+  // write(STDOUT_FILENO, "\n", 1);
+}

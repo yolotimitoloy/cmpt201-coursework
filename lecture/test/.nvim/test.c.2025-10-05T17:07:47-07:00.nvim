@@ -1,0 +1,14 @@
+#define _GNU_SOURCE
+#include <limits.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int main() {
+  char buffer[1024];
+  getcwd(buffer, sizeof(buffer));
+  size_t length = strlen(buffer);
+  write(STDOUT_FILENO, buffer, length);
+}

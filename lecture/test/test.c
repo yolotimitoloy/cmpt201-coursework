@@ -1,0 +1,326 @@
+#define _GNU_SOURCE
+#include "msgs.h"
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+void handle_sigint(int sig) {
+  write(STDOUT_FILENO, "\n", 1);
+  const char *msg = FORMAT_MSG("help", HELP_HELP_MSG);
+  write(STDOUT_FILENO, msg, strlen(msg));
+  const char *msg2 = FORMAT_MSG("cd", CD_HELP_MSG);
+  write(STDOUT_FILENO, msg2, strlen(msg2));
+  const char *msg3 = FORMAT_MSG("exit", EXIT_HELP_MSG);
+  write(STDOUT_FILENO, msg3, strlen(msg3));
+  const char *msg4 = FORMAT_MSG("pwd", PWD_HELP_MSG);
+  write(STDOUT_FILENO, msg4, strlen(msg4));
+  const char *msg5 = FORMAT_MSG("history", HISTORY_HELP_MSG);
+  write(STDOUT_FILENO, msg5, strlen(msg5));
+}
+
+bool numOnly(char *input) {
+  for (int i = 1; input[i] != '\0'; i++) {
+    if (!isdigit(input[1])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void phrase(char *input, char **args) {
+  for (int x = 0; x < 16; x++) {
+    args[x] = NULL;
+  }
+  int i = 0;
+  char *token = NULL;
+  char *ptr = NULL;
+  while ((token = strtok_r(input, " \t\n\r", &ptr))) {
+    args[i] = token;
+    i++;
+    input = NULL;
+  }
+  args[i] = NULL;
+}
+
+bool background(char **args) {
+  for (int i = 0; i < 7; i++) {
+    if (strcmp(args[i], "&") == 0 && args[i + 1] == NULL) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void printArgs(char **args) {
+  for (int i = 0; args[i] != NULL; i++) {
+    write(STDOUT_FILENO, args[i], strlen(args[i]));
+    write(STDOUT_FILENO, "\n", 1);
+  }
+}
+char *input_hist[10];
+int hist = 0;
+int count = 0;
+void dequeue() {
+  free(input_hist[0]);
+  for (int i = 1; i < hist; i++) {
+    input_hist[i - 1] = input_hist[i];
+  }
+  hist--;
+}
+
+void removeLast() {
+  if (hist <= 0) {
+    return;
+  }
+  free(input_hist[hist - 1]);
+  hist--;
+  if (count > 0) {
+    count--;
+  }
+}
+
+void enqueue(char *input) {
+  if (hist > 9) {
+    dequeue();
+  }
+  input_hist[hist] = strdup(input);
+  hist++;
+  count++;
+}
+
+char *get_hist(int num) {
+  if (num == 0 && count >= 1) {
+    return input_hist[0];
+  } else if (num == 0) {
+    return NULL;
+  } else if (num > count || num < count - hist) {
+    return NULL;
+  } else if (count < 10) {
+    return input_hist[num];
+  } else {
+    // debugging
+    //    write(STDOUT_FILENO, input_hist[count - num], strlen(input_hist[count
+    //    - num]));
+    return input_hist[num - count + hist];
+  }
+}
+
+char *get_Last() { return input_hist[hist - 1]; }
+
+void print_hist() {
+  for (int i = hist - 1; i >= 0; i--) {
+    char counter[10];
+    int temp = count - hist + i + 1;
+    int tempLen = sprintf(counter, "%d: ", temp);
+    write(STDOUT_FILENO, counter, tempLen);
+    write(STDOUT_FILENO, input_hist[i], strlen(input_hist[i]));
+  }
+}
+void reap_background() {
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "[Reaped background PID %d]\n", pid);
+    write(STDOUT_FILENO, buf, len);
+  }
+}
+int main() {
+  char cwd_buffer[4096];
+  char *args[16];
+  char input[4096];
+  char lastPath[4096];
+  int status;
+  struct sigaction act;
+  act.sa_handler = handle_sigint;
+  act.sa_flags = 0;
+  sigemptyset(&act.sa_mask);
+
+  int ret = sigaction(SIGINT, &act, NULL);
+  if (ret == -1) {
+    perror("Sigaction() failed\n");
+    exit(EXIT_FAILURE);
+  }
+  while (true) {
+
+    getcwd(cwd_buffer, sizeof(cwd_buffer));
+    size_t length = strlen(cwd_buffer);
+    write(STDOUT_FILENO, cwd_buffer, length);
+    write(STDOUT_FILENO, "$ ", 2);
+    ssize_t inputLenght = read(STDIN_FILENO, input, sizeof(input) - 1);
+
+    // check for !! history
+    if (inputLenght == -1) {
+      if (errno == EINTR) {
+        continue;
+      }
+      const char *msg = FORMAT_MSG("shell", READ_ERROR_MSG);
+      write(STDOUT_FILENO, msg, strlen(msg));
+      continue;
+    }
+    input[inputLenght] = '\0';
+
+    if (input[0] == '!') {
+      if (input[1] == '!') {
+        char *temp = get_Last();
+        if (temp == NULL) {
+          const char *msg = FORMAT_MSG("history", HISTORY_NO_LAST_MSG);
+          write(STDOUT_FILENO, msg, strlen(msg));
+          continue;
+        }
+        strncpy(input, temp, strlen(temp));
+        input[strlen(temp)] = '\0';
+      } else {
+        char intHist[4];
+        strcpy(intHist, input + 1);
+        int temp_Hist = atoi(intHist);
+        char *temp = get_hist(temp_Hist);
+        if (!numOnly(input)) {
+          const char *msg = FORMAT_MSG("history", HISTORY_INVALID_MSG);
+          write(STDOUT_FILENO, msg, strlen(msg));
+          continue;
+        } else if (temp == NULL && hist == 0) {
+          const char *msg = FORMAT_MSG("history", HISTORY_NO_LAST_MSG);
+          write(STDOUT_FILENO, msg, strlen(msg));
+          continue;
+        }
+        strncpy(input, temp, strlen(temp));
+        input[strlen(temp)] = '\0';
+      }
+    }
+
+    enqueue(input);
+    phrase(input, args);
+    //   printArgs(args);
+    if (args[0] == NULL) {
+      const char *msg = FORMAT_MSG("shell", READ_ERROR_MSG);
+      write(STDOUT_FILENO, msg, strlen(msg));
+      removeLast();
+      continue;
+    } else if (strcmp(args[0], "history") == 0) {
+      if (args[1] != NULL) {
+        const char *msg = FORMAT_MSG("history", TMA_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      }
+      print_hist();
+    } else if (strcmp(args[0], "exit") == 0) {
+      if (args[1] != NULL) {
+        const char *msg = FORMAT_MSG("exit", TMA_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      }
+      break;
+    } else if (strcmp(args[0], "cd") == 0) {
+      if (args[2] != NULL) {
+        const char *msg = FORMAT_MSG("cd", TMA_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      }
+      char *path = args[1];
+      if (path == NULL) {
+        path = getenv("HOME");
+      } else if (path[0] == '~') {
+        static char temp[4096];
+        snprintf(temp, sizeof(temp), "%s%s", getenv("HOME"), path + 1);
+        path = temp;
+      } else if (path[0] == '-') {
+        chdir(getenv("HOME"));
+        path = lastPath;
+      }
+      if (chdir(path) == -1 && args[1][0] != '~') {
+        const char *msg = FORMAT_MSG("cd", CHDIR_ERROR_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      } // error messgae
+      strncpy(lastPath, cwd_buffer, sizeof(lastPath));
+    } else if (strcmp(args[0], "pwd") == 0) {
+      if (args[1] != NULL) {
+        const char *msg = FORMAT_MSG("pwd", TMA_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      }
+      if (getcwd(cwd_buffer, sizeof(cwd_buffer)) == NULL) {
+        const char *msg = FORMAT_MSG("pwd", GETCWD_ERROR_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      }
+      getcwd(cwd_buffer, sizeof(cwd_buffer));
+      size_t length = strlen(cwd_buffer);
+      write(STDOUT_FILENO, cwd_buffer, length);
+      write(STDOUT_FILENO, "\n", 1);
+    } else if (strcmp(args[0], "help") == 0) {
+      if (args[2] != NULL) {
+        const char *msg = FORMAT_MSG("help", TMA_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      }
+
+      if (args[1] == NULL) {
+        const char *msg = FORMAT_MSG("help", HELP_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        const char *msg2 = FORMAT_MSG("cd", CD_HELP_MSG);
+        write(STDOUT_FILENO, msg2, strlen(msg2));
+        const char *msg3 = FORMAT_MSG("exit", EXIT_HELP_MSG);
+        write(STDOUT_FILENO, msg3, strlen(msg3));
+        const char *msg4 = FORMAT_MSG("pwd", PWD_HELP_MSG);
+        write(STDOUT_FILENO, msg4, strlen(msg4));
+        const char *msg5 = FORMAT_MSG("history", HISTORY_HELP_MSG);
+        write(STDOUT_FILENO, msg5, strlen(msg5));
+      } else if (strcmp(args[1], "help") == 0) {
+        const char *msg = FORMAT_MSG("help", HELP_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "cd") == 0) {
+        const char *msg = FORMAT_MSG("cd", CD_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "exit") == 0) {
+        const char *msg = FORMAT_MSG("exit", EXIT_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "pwd") == 0) {
+        const char *msg = FORMAT_MSG("pwd", PWD_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else if (strcmp(args[1], "history") == 0) {
+        const char *msg = FORMAT_MSG("history", HISTORY_HELP_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+      } else {
+        char msg[1024];
+        int len =
+            snprintf(msg, sizeof(msg), "%s: %s\n", args[1], EXTERN_HELP_MSG);
+        write(STDOUT_FILENO, msg, len);
+      }
+    } else {
+      int pid = fork();
+      if (pid < 0) {
+        const char *msg = FORMAT_MSG("shell", FORK_ERROR_MSG);
+        write(STDOUT_FILENO, msg, strlen(msg));
+        continue;
+      } else if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        if (execvp(args[0], args) < 0) {
+          const char *err = "exec failed\n";
+          write(STDOUT_FILENO, err, strlen(err));
+          _exit(1);
+        }
+      } else {
+        if (!background(args)) {
+          waitpid(pid, &status, 0);
+        } else {
+          char buf[64];
+          int len = snprintf(buf, sizeof(buf), "[Background PID %d]\n", pid);
+          write(STDOUT_FILENO, buf, len);
+        }
+      }
+    }
+
+    // else fork()?
+
+  } // free(cwd_buffer);
+    // free(args);
+    // free(input);
+}

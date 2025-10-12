@@ -1,0 +1,32 @@
+#define _GNU_SOURCE
+#include <limits.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+void phrase(char *input, char **args) {
+  int i = 0;
+  char *token = strtok(input, " \t\n");
+  while (token != NULL && i < 64 - 1) {
+    args[i++];
+    token = strtok(NULL, " \t\n");
+  }
+  args[i] = NULL;
+}
+
+int main() {
+  char cwd_buffer[1024];
+  char input[1024];
+  char *args[64];
+  getcwd(cwd_buffer, sizeof(cwd_buffer));
+  size_t length = strlen(cwd_buffer);
+  write(STDOUT_FILENO, cwd_buffer, length);
+  write(STDOUT_FILENO, " ", 1);
+  read(STDIN_FILENO, input, sizeof(input) - 1);
+  write(STDOUT_FILENO, " ", 1);
+  write(STDOUT_FILENO, input, strlen(input));
+
+  //write(STDOUT_FILENO, "\n", 1);
+}

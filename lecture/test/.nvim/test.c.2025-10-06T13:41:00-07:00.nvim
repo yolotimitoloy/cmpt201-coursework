@@ -1,0 +1,79 @@
+#define _GNU_SOURCE
+#include <limits.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+void phrase(char *input, char **args) {
+  int i = 0;
+  char *token = NULL;
+  char *ptr = NULL;
+  while ((token = strtok_r(input, " \t\n\r", &ptr))) {
+    args[i] = token;
+    i++;
+    input = NULL;
+  }
+  i++;
+  args[i] = NULL;
+}
+void printArgs(char **args) {
+  for (int i = 0; args[i] != NULL; i++) {
+    write(STDOUT_FILENO, args[i], strlen(args[i]));
+    write(STDOUT_FILENO, "\n", 1);
+  }
+}
+char *input_hist[10];
+int hist = 0;
+int count = 0;
+void dequeue() {
+  free(input_hist[0]);
+  for (int i = 1; i < hist; i++) {
+    input_hist[i - 1] = input_hist[i];
+  }
+  hist--;
+}
+
+void enqueue(char *input) {
+  if (hist > 10) {
+    dequeue();
+  }
+  input_hist[hist] = strdup(input);
+  hist++;
+  count++;
+}
+
+void print_hist() {
+  for (int i = 0; i < hist; i++) {
+    char counter[10];
+    int temp = count - hist + i;
+    int tempLen = sprintf(counter,"%d :", temp);
+    write(STDOUT_FILENO, counter,tempLen); 
+    write(STDOUT_FILENO, input_hist[i], strlen(input_hist[i]));
+  }
+}
+
+int main() {
+  char cwd_buffer[1024];
+  char *args[64];
+  char input[128];
+
+  while (true) {
+    getcwd(cwd_buffer, sizeof(cwd_buffer));
+    size_t length = strlen(cwd_buffer);
+    write(STDOUT_FILENO, cwd_buffer, length);
+    write(STDOUT_FILENO, " ", 1);
+    ssize_t inputLenght = read(STDIN_FILENO, input, sizeof(input) - 1);
+    input[inputLenght] = '\0';
+    //    write(STDOUT_FILENO, input, strlen(input));
+    enqueue(input);
+    phrase(input, args);
+    if (strcmp(args[0], "history") == 0) {
+      print_hist();
+    }
+    //  printArgs(args);
+  }
+  // write(STDOUT_FILENO, "\n", 1);
+}

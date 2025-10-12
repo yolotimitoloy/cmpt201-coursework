@@ -1,0 +1,14 @@
+#define _GNU_SOURCE
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+
+
+int main() {
+  char buffer[PATH_MAX];
+  getcwd(buffer, sizeof(buffer));
+  write(STDOUT_FILENO, buffer, sizeof(buffer));
+}

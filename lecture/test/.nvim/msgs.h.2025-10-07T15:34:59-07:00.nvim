@@ -1,0 +1,10 @@
+#pragma once
+
+#define HELP_HELP_MSG "show help information"
+#define EXTERN_HELP_MSG "external command or application"
+#define EXIT_HELP_MSG "exit the shell"
+#define PWD_HELP_MSG "print the current directory"
+#define CD_HELP_MSG "change the current directory"
+#define HISTORY_HELP_MSG "print the history of the commands"
+
+#define FORMAT_MSG(cmd,msg) cmd ": " msg "\n"
