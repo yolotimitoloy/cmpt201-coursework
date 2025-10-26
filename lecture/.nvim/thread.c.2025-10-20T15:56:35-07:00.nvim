@@ -1,0 +1,18 @@
+#include <string.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+void *printing(void *arg) {
+  char *mess = (char *)arg;
+  printf("Message is : %s\n", mess);
+  return (void *) strlen(mess);
+}
+
+int main() {
+  void *ret_val = 0;
+  pthread_t temp;
+  pthread_create(&temp, NULL, printing, "YOLO");
+  pthread_join(temp, &ret_val);
+  printf("%lu\n", (uint64_t)ret_val);
+}

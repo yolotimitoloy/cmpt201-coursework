@@ -1,0 +1,284 @@
+#define _DEFAULT_SOURCE
+#include "alloc.h"
+#include <unistd.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+#define HEADER_SIZE (sizeof(struct header))
+
+/* Free list head (each free header->size stores payload size). */
+static struct header *free_list = NULL;
+
+/* Allocation options */
+static enum algs current_alg = FIRST_FIT;
+/* Maximum heap size allowed (configured via allocopt). Default: INCREMENT */
+static size_t max_heap_size = INCREMENT;
+
+/* Track how many bytes we've grown the heap so far */
+static size_t total_heap_allocated = 0;
+
+/* Ensure initial heap allocation (first sbrk call). Returns true on success. */
+static bool extend_heap_once(void) {
+  if (total_heap_allocated + INCREMENT > max_heap_size) return false;
+  void *brk = sbrk(INCREMENT);
+  if (brk == (void *)-1) return false;
+
+  struct header *new_free = (struct header *)brk;
+  /* free header stores payload size (excluding header) */
+  new_free->size = INCREMENT - HEADER_SIZE;
+  new_free->next = NULL;
+
+  /* Insert in address-sorted order (append at end) and coalesce if adjacent */
+  if (free_list == NULL) {
+    free_list = new_free;
+  } else {
+    struct header *curr = free_list;
+    struct header *prev = NULL;
+    while (curr && curr < new_free) {
+      prev = curr;
+      curr = curr->next;
+    }
+    if (prev == NULL) {
+      /* insert at front */
+      new_free->next = free_list;
+      free_list = new_free;
+    } else {
+      prev->next = new_free;
+      new_free->next = curr;
+    }
+    /* try coalesce with previous if adjacent */
+    if (prev) {
+      char *prev_end = (char *)prev + HEADER_SIZE + prev->size;
+      if (prev_end == (char *)new_free) {
+        /* merge prev and new_free: prev.payload += HEADER_SIZE + new_free.payload */
+        prev->size = prev->size + HEADER_SIZE + new_free->size;
+        prev->next = new_free->next;
+        new_free = prev; /* merged block for potential further coalesce */
+      }
+    }
+    /* try coalesce with next (which is curr) */
+    if (new_free->next) {
+      char *new_free_end = (char *)new_free + HEADER_SIZE + new_free->size;
+      if (new_free_end == (char *)new_free->next) {
+        struct header *n = new_free->next;
+        new_free->size = new_free->size + HEADER_SIZE + n->size;
+        new_free->next = n->next;
+      }
+    }
+  }
+
+  total_heap_allocated += INCREMENT;
+  return true;
+}
+
+/* Find block according to current algorithm. prev_out receives the previous free node (or NULL if head). */
+static struct header *find_block(size_t req_size, struct header **prev_out) {
+  struct header *prev = NULL;
+  struct header *curr = free_list;
+
+  if (current_alg == FIRST_FIT) {
+    while (curr) {
+      if (curr->size >= (int)req_size) {
+        *prev_out = prev;
+        return curr;
+      }
+      prev = curr;
+      curr = curr->next;
+    }
+    *prev_out = NULL;
+    return NULL;
+  }
+
+  /* BEST_FIT or WORST_FIT: track best match */
+  struct header *best = NULL;
+  struct header *best_prev = NULL;
+  while (curr) {
+    if (curr->size >= (int)req_size) {
+      if (best == NULL) {
+        best = curr;
+        best_prev = prev;
+      } else if (current_alg == BEST_FIT) {
+        if (curr->size < best->size) {
+          best = curr;
+          best_prev = prev;
+        }
+      } else if (current_alg == WORST_FIT) {
+        if (curr->size > best->size) {
+          best = curr;
+          best_prev = prev;
+        }
+      }
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+  *prev_out = best_prev;
+  return best;
+}
+
+/* Remove a block from free list given prev pointer */
+static void remove_free_block(struct header *prev, struct header *block) {
+  if (prev == NULL) {
+    free_list = block->next;
+  } else {
+    prev->next = block->next;
+  }
+  block->next = NULL;
+}
+
+/* Public API */
+
+void *alloc(int size) {
+  if (size <= 0) return NULL;
+
+  /* Ensure at least one chunk exists */
+  if (free_list == NULL) {
+    if (!extend_heap_once()) return NULL;
+  }
+
+  /* Try to find a block; if not found, try to extend heap until either found or cannot extend. */
+  struct header *prev = NULL;
+  struct header *block = find_block((size_t)size, &prev);
+
+  while (block == NULL) {
+    /* try to extend heap (if allowed by max_heap_size) */
+    if (!extend_heap_once()) break;
+    block = find_block((size_t)size, &prev);
+  }
+
+  if (block == NULL) return NULL; /* out of memory */
+
+  /* block->size is free payload. We will allocate S bytes payload and a header.
+     allocated_total = size + HEADER_SIZE
+     leftover_free_payload = block->size - (size + HEADER_SIZE)
+  */
+  size_t allocated_total = (size_t)size + HEADER_SIZE;
+
+  if ((long long)block->size >= (long long)allocated_total) {
+    /* split: there is room to create a new free header after the allocated region */
+    size_t old_free_payload = block->size;
+    /* location of new free header: after allocated_total bytes from block start */
+    struct header *new_free = (struct header *)((char *)block + allocated_total);
+
+    /* new_free payload size (free payload excluding its header) */
+    new_free->size = old_free_payload - allocated_total;
+    new_free->next = block->next;
+
+    /* Remove block from free-list, but insert new_free in its place */
+    if (prev == NULL) {
+      free_list = new_free;
+    } else {
+      prev->next = new_free;
+    }
+
+    /* Set allocated header's size field to allocated_total (allocated blocks store total). */
+    block->size = allocated_total;
+    block->next = NULL;
+    return (void *)((char *)block + HEADER_SIZE);
+  } else {
+    /* block->size < allocated_total but we checked block->size >= size earlier to be candidate.
+       This case shouldn't happen if we require block->size >= allocated_total for splitting.
+       As a fallback, allocate the entire free block to satisfy request (no split).
+       For that, allocated_total becomes (block->size + HEADER_SIZE). */
+    size_t old_free_payload = block->size;
+    size_t allocated_total_full = old_free_payload + HEADER_SIZE;
+
+    /* remove block from free list */
+    remove_free_block(prev, block);
+
+    block->size = allocated_total_full; /* allocated header stores total (payload + header) */
+    block->next = NULL;
+    return (void *)((char *)block + HEADER_SIZE);
+  }
+}
+
+void dealloc(void *ptr) {
+  if (ptr == NULL) return;
+
+  struct header *block = (struct header *)((char *)ptr - HEADER_SIZE);
+  /* For allocated blocks, header->size stores total (payload + header) */
+  size_t allocated_total = block->size;
+  /* Convert to free payload size */
+  size_t free_payload = 0;
+  if (allocated_total >= HEADER_SIZE) free_payload = allocated_total - HEADER_SIZE;
+  block->size = free_payload;
+  block->next = NULL;
+
+  /* Insert block into free_list in address order */
+  if (free_list == NULL) {
+    free_list = block;
+    return;
+  }
+
+  struct header *curr = free_list;
+  struct header *prev = NULL;
+  while (curr && curr < block) {
+    prev = curr;
+    curr = curr->next;
+  }
+
+  if (prev == NULL) {
+    /* insert at front */
+    block->next = free_list;
+    free_list = block;
+  } else {
+    prev->next = block;
+    block->next = curr;
+  }
+
+  /* Try coalescing with previous */
+  if (prev) {
+    char *prev_end = (char *)prev + HEADER_SIZE + prev->size;
+    if (prev_end == (char *)block) {
+      /* merge prev and block */
+      prev->size = prev->size + HEADER_SIZE + block->size;
+      prev->next = block->next;
+      block = prev;
+    }
+  }
+
+  /* Try coalescing with next (curr) */
+  if (block->next) {
+    char *block_end = (char *)block + HEADER_SIZE + block->size;
+    if (block_end == (char *)block->next) {
+      struct header *n = block->next;
+      block->size = block->size + HEADER_SIZE + n->size;
+      block->next = n->next;
+    }
+  }
+}
+
+void allocopt(enum algs alg, int limit) {
+  current_alg = alg;
+  if (limit > 0) {
+    max_heap_size = (size_t)limit;
+  } else {
+    max_heap_size = INCREMENT;
+  }
+  /* reset bookkeeping so tests can call allocopt before each case:
+     do not destroy existing heap; tests always call allocopt before using allocator.
+     But ensure we will respect new max_heap_size for future sbrk calls. */
+}
+
+struct allocinfo allocinfo(void) {
+  struct allocinfo info;
+  info.free_size = 0;
+  info.free_chunks = 0;
+  info.largest_free_chunk_size = 0;
+  info.smallest_free_chunk_size = 0;
+
+  struct header *curr = free_list;
+  while (curr) {
+    info.free_size += curr->size; /* free payload bytes */
+    info.free_chunks++;
+    if (info.largest_free_chunk_size == 0 || curr->size > info.largest_free_chunk_size)
+      info.largest_free_chunk_size = curr->size;
+    if (info.smallest_free_chunk_size == 0 || curr->size < info.smallest_free_chunk_size)
+      info.smallest_free_chunk_size = curr->size;
+    curr = curr->next;
+  }
+  return info;
+}
+

@@ -1,0 +1,58 @@
+#define _DEFAULT_SOURCE
+
+#include "alloc.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[]) {
+  allocopt(WORST_FIT, 256);
+  int size = sizeof(struct header);
+  void *p[11] = {NULL};
+  for (int i = 0; i < 9; i++) {
+    p[i] = alloc(8);
+  }
+  struct allocinfo info;
+  info = allocinfo();
+  printf("free_size: %lu, free_chunks: %lu, largest_free_chunk_size: %lu, "
+         "smallest_free_chunk_size: %lu\n",
+         info.free_size, info.free_chunks, info.largest_free_chunk_size,
+         info.smallest_free_chunk_size);
+
+  dealloc(p[1]);
+  dealloc(p[3]);
+  dealloc(p[5]);
+  dealloc(p[7]);
+  info = allocinfo();
+  dealloc(p[0]);
+  dealloc(p[2]);
+  dealloc(p[4]);
+  dealloc(p[6]);
+  dealloc(p[8]);
+  info = allocinfo();
+
+  /*
+    for (int i = 0; i < 6; i--) {
+      dealloc(p[i]);
+      //    printinfo();
+    }
+
+      printf("free_size: %lu, free_chunks: %lu, largest_free_chunk_size: %lu, "
+             "smallest_free_chunk_size: %lu\n",
+             info.free_size, info.free_chunks, info.largest_free_chunk_size,
+             info.smallest_free_chunk_size);
+    */
+  //  printinfo();
+  info = allocinfo();
+  printf("free_size: %lu, free_chunks: %lu, largest_free_chunk_size: %lu, "
+         "smallest_free_chunk_size: %lu\n",
+         info.free_size, info.free_chunks, info.largest_free_chunk_size,
+         info.smallest_free_chunk_size);
+  //  allocopt(FIRST_FIT, 256);
+  //  free(temp);
+  // free(temp2);
+  // free(temp3);
+  return 0;
+}

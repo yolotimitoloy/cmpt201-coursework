@@ -1,0 +1,19 @@
+#define _DEFAULT_SOURCE
+
+#include "alloc.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define HEADER_SIZE (sizeof(struct header))
+
+int main(int argc, char *argv[]) { 
+  printf("%p\n", sbrk(0)); 
+  void* temp = alloc(1);
+ printf("%p\n", temp); 
+
+  return 0; 
+
+}

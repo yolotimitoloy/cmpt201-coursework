@@ -1,0 +1,208 @@
+#define _DEFAULT_SOURCE
+#include "alloc.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int limit = 0;
+static enum algs algs = FIRST_FIT;
+static struct header *head = NULL;
+static void *heap_origin = NULL;
+static void *heap_end = NULL;
+static bool deallocCalled = false;
+
+// algs
+struct header *first_fit(struct header *free, uint64_t size) {
+  while (free != NULL) {
+    if (free->size >= size) {
+      return free;
+    }
+    free = free->next;
+  }
+  return NULL;
+}
+struct header *best_fit(struct header *free, uint64_t size) {
+  struct header *best = NULL;
+  uint64_t best_size = UINT64_MAX;
+  while (free != NULL) {
+    if (free->size >= size && free->size < best_size) {
+      best = free;
+      best_size = free->size;
+    }
+    free = free->next;
+  }
+  return best;
+}
+struct header *worst_fit(struct header *free, uint64_t size) {
+  struct header *worst = NULL;
+  uint64_t worst_size = 0;
+  while (free != NULL) {
+    if (free->size >= size && free->size > worst_size) {
+      worst = free;
+      worst_size = free->size;
+    }
+    free = free->next;
+  }
+  return worst;
+}
+struct header *get_last(struct header *block) {
+  struct header *last = NULL;
+  struct header *free = head;
+  while (free != NULL) {
+    if (free == block) {
+      return last;
+    }
+    last = free;
+    free = free->next;
+  }
+  return NULL;
+}
+struct header *get_next(struct header *block) { return block->next; }
+
+void *alloc(int size) {
+  if (deallocCalled == false) {
+    if (head == NULL) {
+      void *start = sbrk(INCREMENT);
+      heap_origin = start;
+      heap_end = sbrk(0);
+      struct header *block = (struct header *)start;
+      block->size = size + sizeof(struct header);
+      block->next = NULL;
+      struct header *next_block = (struct header *)((char *)(block + 1) + size);
+      next_block->size = INCREMENT - sizeof(struct header) * 2 - size;
+      next_block->next = NULL;
+      head = next_block;
+      void *return_ptr = (void *)(block + 1);
+      return return_ptr;
+    }
+
+    if (head->size < size && heap_end - heap_origin == limit) {
+      return NULL;
+    }
+
+    if (head->size < size && head->size < size + sizeof(struct header) &&
+        heap_end - heap_origin == limit) {
+      struct header *block = head;
+      void *return_ptr = (void *)(block + 1);
+      head = NULL;
+      return return_ptr;
+    }
+
+    if (head->size < size && head->size < size + sizeof(struct header) * 2 &&
+        heap_end - heap_origin < limit) {
+      struct header *block = head;
+      block->size += sizeof(struct header);
+      void *return_ptr = (void *)(block + 1);
+      head = NULL;
+      return return_ptr;
+    }
+    if (heap_end - heap_origin < limit &&
+        (head->size < size ||
+         (head->size >= size && head->size < size + sizeof(struct header)))) {
+      sbrk(INCREMENT);
+      heap_end = sbrk(0);
+      head += INCREMENT;
+    }
+    struct header *block = head;
+    struct header *next_block = (struct header *)((char *)(block + 1) + size);
+    next_block->size = block->size - size - sizeof(struct header);
+    next_block->next = NULL;
+    block->size = size + sizeof(struct header);
+    head = next_block;
+    void *return_ptr = (void *)(block + 1);
+    if (head->size == 0) {
+      block->size += sizeof(struct header);
+      head = (void *)(next_block + 1);
+    }
+    return return_ptr;
+  } else {
+    struct header *block = head;
+    struct header *temp = NULL;
+    switch (algs) {
+    case FIRST_FIT:
+      temp = first_fit(block, size + sizeof(struct header));
+      break;
+    case BEST_FIT:
+      temp = best_fit(block, size + sizeof(struct header));
+      break;
+    case WORST_FIT:
+      temp = worst_fit(block, size + sizeof(struct header));
+      break;
+    }
+    struct header *next_block = get_next(temp);
+    struct header *new_block = (struct header *)((char *)(temp + 1) + size);
+    if (temp->size < size + sizeof(struct header)) {
+      void *return_ptr = (void *)(temp + 1);
+      head = next_block;
+      return return_ptr;
+    } else {
+      new_block->size = temp->size - size - sizeof(struct header);
+      new_block->next = next_block;
+      void *return_ptr = (void *)(temp + 1);
+      if (head == NULL) {
+        head = new_block;
+      } else {
+        struct header *last = get_last(temp);
+        last->next = new_block;
+      }
+      return return_ptr;
+    }
+  }
+}
+
+void dealloc(void *header) {
+  deallocCalled = true;
+  struct header *block = (struct header *)(header - 1);
+  uint64_t size = block->size - sizeof(struct header);
+  block->next = head;
+  head = block;
+}
+
+void allocopt(enum algs algopt, int size) {
+  void *current = sbrk(0);
+  intptr_t sizeDif = (char *)current - (char *)heap_origin;
+  if (sizeDif > 0) {
+    sbrk(-size);
+  }
+  limit = size;
+  algs = algopt;
+  head = NULL;
+  heap_origin = sbrk(0);
+  heap_end = (char *)heap_origin + size;
+  deallocCalled = false;
+}
+
+struct allocinfo allocinfo() {
+  uint64_t temp = 0;
+  uint64_t max = 0;
+  uint64_t min = UINT64_MAX;
+  uint64_t count = 0;
+  struct header *free = head;
+  while (free != NULL) {
+    count++;
+    temp += free->size;
+    if (free->size < min) {
+      min = free->size;
+    }
+    if (free->size > max) {
+      max = free->size;
+    }
+    free = free->next;
+  }
+  if (temp == 0) {
+    min = temp;
+  }
+  if (temp == limit) {
+    temp -= sizeof(struct header);
+  }
+  struct allocinfo info;
+  info.free_size = temp;
+  info.free_chunks = count;
+  info.largest_free_chunk_size = max;
+  info.smallest_free_chunk_size = min;
+  return info;
+}

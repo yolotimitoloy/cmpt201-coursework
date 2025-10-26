@@ -1,0 +1,165 @@
+#include "alloc.h"
+#include <stdio.h>
+#include <stdlib.h> // for NULL
+#include <string.h> // for memset
+
+#define HEAP_SIZE 8192 // total simulated heap size
+
+// Simulated heap memory
+static uint8_t heap[HEAP_SIZE];
+
+// Free list head
+static struct header *free_list = NULL;
+
+// Allocation options
+static enum algs current_alg = FIRST_FIT;
+static int size_limit = HEAP_SIZE;
+
+// Initialize the heap once
+static void init_heap(void) {
+  if (free_list == NULL) {
+    free_list = (struct header *)heap;
+    free_list->size = HEAP_SIZE - sizeof(struct header);
+    free_list->next = NULL;
+  }
+}
+
+/* ------------------------------ Utility ------------------------------ */
+
+// Split a free block if it’s much larger than requested
+static void split_block(struct header *block, uint64_t size) {
+    if (block->size >= size + sizeof(struct header) + 1) {
+        struct header *new_block =
+            (struct header *)((uint8_t *)block + sizeof(struct header) + size);
+        new_block->size = block->size - size - sizeof(struct header);
+        new_block->next = block->next;   // ok
+        block->size = size;
+
+        // replace block in free_list with new_block
+        if (free_list == block) {
+            free_list = new_block;
+        } else {
+            struct header *prev = free_list;
+            while (prev && prev->next != block) prev = prev->next;
+            if (prev) prev->next = new_block;
+        }
+    }
+}
+
+
+// Remove a block from the free list
+static void remove_block(struct header *prev, struct header *block) {
+  if (prev == NULL) {
+    free_list = block->next;
+  } else {
+    prev->next = block->next;
+  }
+}
+
+/* -------------------------- Allocation Algorithms --------------------------
+ */
+
+static struct header *find_block(uint64_t size, struct header **prev_out) {
+  struct header *best = NULL;
+  struct header *best_prev = NULL;
+  struct header *prev = NULL;
+  struct header *curr = free_list;
+
+  while (curr != NULL) {
+    if (curr->size >= size) {
+      if (current_alg == FIRST_FIT) {
+        *prev_out = prev;
+        return curr;
+      } else if (current_alg == BEST_FIT) {
+        if (best == NULL || curr->size < best->size) {
+          best = curr;
+          best_prev = prev;
+        }
+      } else if (current_alg == WORST_FIT) {
+        if (best == NULL || curr->size > best->size) {
+          best = curr;
+          best_prev = prev;
+        }
+      }
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+
+  *prev_out = best_prev;
+  return best;
+}
+
+/* ----------------------------- Public API ----------------------------- */
+
+void *alloc(int size) {
+  if (size <= 0)
+    return NULL;
+  if (free_list == NULL)
+    init_heap();
+
+  if (size > size_limit)
+    return NULL;
+
+  struct header *prev = NULL;
+  struct header *block = find_block(size, &prev);
+
+  if (block == NULL)
+    return NULL; // no free block large enough
+
+  split_block(block, size);
+  remove_block(prev, block);
+
+  // Return pointer to usable memory (after header)
+  return (void *)((uint8_t *)block + sizeof(struct header));
+}
+
+void dealloc(void *ptr) {
+    if (!ptr) return;
+    struct header *block = (struct header *)((uint8_t *)ptr - sizeof(struct header));
+
+    // Insert sorted by address
+    struct header **curr = &free_list;
+    while (*curr && *curr < block) curr = &(*curr)->next;
+    block->next = *curr;
+    *curr = block;
+
+    // Coalesce
+    curr = &free_list;
+    while (*curr && (*curr)->next) {
+        uint8_t *end = (uint8_t *)(*curr) + sizeof(struct header) + (*curr)->size;
+        if (end == (uint8_t *)(*curr)->next) {
+            (*curr)->size += sizeof(struct header) + (*curr)->next->size;
+            (*curr)->next = (*curr)->next->next;
+        } else {
+            curr = &(*curr)->next;
+        }
+    }
+}
+
+
+void allocopt(enum algs alg, int limit) {
+  current_alg = alg;
+  size_limit = (limit > 0 && limit <= HEAP_SIZE) ? limit : HEAP_SIZE;
+}
+
+struct allocinfo allocinfo(void) {
+  struct allocinfo info = {0, 0, 0, 0};
+  if (free_list == NULL)
+    init_heap();
+
+  struct header *curr = free_list;
+  while (curr != NULL) {
+    info.free_size += curr->size;
+    info.free_chunks++;
+    if (info.largest_free_chunk_size == 0 ||
+        curr->size > info.largest_free_chunk_size)
+      info.largest_free_chunk_size = curr->size;
+    if (info.smallest_free_chunk_size == 0 ||
+        curr->size < info.smallest_free_chunk_size)
+      info.smallest_free_chunk_size = curr->size;
+    curr = curr->next;
+  }
+
+  return info;
+}

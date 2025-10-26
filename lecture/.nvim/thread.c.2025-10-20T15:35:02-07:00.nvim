@@ -1,0 +1,16 @@
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+void *printing(int i) {
+  sleep(i);
+  return (void*) 42;
+}
+
+int main() {
+   void* ret_val=0; 
+    pthread_t temp;
+    pthread_create(&temp, NULL, printing(1), NULL);
+    pthread_join(temp, ret_val);
+    printf("%lu", (uint64_t) ret_val);
+}

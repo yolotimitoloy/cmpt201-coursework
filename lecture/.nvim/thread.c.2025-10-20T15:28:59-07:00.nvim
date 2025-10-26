@@ -1,0 +1,15 @@
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+void *printing(int i) {
+  sleep(i);
+  printf("HELP ME!\n");
+  sleep(i);
+  pthread_exit(NULL);
+}
+
+int main() {
+  pthread_t temp;
+  pthread_create(&temp, NULL, printing(10), NULL);
+}

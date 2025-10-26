@@ -1,0 +1,25 @@
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int cnt = 0;
+int i = 0;
+#define MAX 10000000
+void *printing(void *arg) {
+  for (; i < MAX; i++) {
+    cnt++;
+  }
+  return NULL;
+}
+
+int main() {
+  void *ret_val = 0;
+  pthread_t temp;
+  pthread_create(&temp, NULL, printing, "YOLO, HELLO WORLD!!");
+  pthread_join(temp, &ret_val);
+   pthread_t temp2;
+  pthread_create(&temp2, NULL, printing, "YOLO, HELLO WORLD!!");
+  pthread_join(temp2, &ret_val);
+  printf("%d\n", cnt);
+}

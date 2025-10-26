@@ -1,0 +1,26 @@
+#define _DEFAULT_SOURCE
+
+#include "alloc.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define HEADER_SIZE (sizeof(struct header))
+
+int main(int argc, char *argv[]) {
+
+  void *start = sbrk(0);
+  printf("%p\n", start);
+  void *temp = malloc(1);
+  printf("%p\n", temp);
+  void *temp2 = malloc(20);
+  printf("%p\n", temp2);
+  void *temp3 = malloc(12);
+  printf("%p\n", temp3);
+  free(temp);
+  free(temp2);
+  free(temp3);
+  return 0;
+}

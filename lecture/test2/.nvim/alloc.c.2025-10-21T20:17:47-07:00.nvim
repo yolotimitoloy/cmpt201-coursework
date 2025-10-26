@@ -1,0 +1,188 @@
+#define _DEFAULT_SOURCE
+#include "alloc.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static enum algs algs = FIRST_FIT;
+static struct header *head = NULL; // first block (our region)
+static void *heap_origin = NULL;   // where heap starts
+static void *heap_end = NULL;
+static bool deallocCalled = false;
+
+struct header *get_last(struct header *free_list_ptr, struct header *block) {
+  struct header *last = NULL;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr == block) {
+      return last;
+    }
+    last = free_list_ptr;
+    free_list_ptr = free_list_ptr->next;
+  }
+  return NULL;
+}
+
+struct header *find_first_fit(struct header *free_list_ptr, uint64_t size) {
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size) {
+      return free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return NULL;
+}
+struct header *get_next(struct header *free_list_ptr, struct header *block) {
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr == block) {
+      return free_list_ptr->next;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return NULL;
+}
+struct header *find_best_fit(struct header *free_list_ptr, uint64_t size) {
+  struct header *best_fit = NULL;
+  uint64_t best_fit_size = UINT64_MAX;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size < best_fit_size) {
+      best_fit_size = free_list_ptr->size;
+      best_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return best_fit;
+}
+struct header *find_worst_fit(struct header *free_list_ptr, uint64_t size) {
+  struct header *worst_fit = NULL;
+  uint64_t worst_fit_size = 0;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size > worst_fit_size) {
+      worst_fit_size = free_list_ptr->size;
+      worst_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return worst_fit;
+}
+
+void *alloc(int size) {
+  if (head == NULL) {
+    printf("Error: allocator not initialized (call allocopt first)\n");
+    return NULL;
+  }
+  if (deallocCalled == false) {
+    if (head->size < (uint64_t)size + sizeof(struct header)) {
+      printf("Out of memory! Requested %d, available %lu\n", size, head->size);
+      void *res = sbrk(256);
+      if (res == (void *)-1) {
+        perror("sbrk failed");
+        return NULL;
+      }
+      heap_end = sbrk(0);
+      head->size += 256; // increase the remaining block size by the new space
+      printf("[alloc] extended heap by 256 bytes, new heap_end=%p, total "
+             "free=%lu\n",
+             heap_end, head->size);
+    }
+    struct header *block = head;
+    struct header *next_block = (struct header *)((char *)(block + 1) + size);
+    next_block->size = block->size - size - sizeof(struct header);
+    next_block->next = NULL;
+    block->size = size;
+    void *user_ptr = (void *)(block + 1);
+    head = next_block;
+    printf("[alloc] allocated %d bytes at %p, next free at %p (remaining %lu "
+           "bytes)\n",
+           size, user_ptr, head, head->size);
+    return user_ptr;
+  } else {
+    struct header *block = head;
+    struct header *temp = NULL;
+    switch (algs) {
+    case FIRST_FIT:
+      temp = find_first_fit(block, size);
+      break;
+    case BEST_FIT:
+      temp = find_best_fit(block, size);
+      break;
+    case WORST_FIT:
+      temp = find_worst_fit(block, size);
+      break;
+    }
+    struct header *next_block = get_next(block, temp);
+    struct header *new_block = (struct header *)((char *)(temp + 1) + size);
+    new_block->size = temp->size - size - sizeof(struct header);
+    new_block->next = next_block;
+    temp->size = size;
+    void *user_ptr = (void *)(temp);
+    head = new_block;
+    printf("[alloc] allocated %d bytes at %p\n", size, user_ptr);
+    return user_ptr;
+  }
+}
+
+void dealloc(void *header) {
+  if (!header)
+    return;
+  deallocCalled = true;
+  struct header *block = (struct header *)header - 1;
+  uint64_t size = block->size;
+  block->next = head;
+  head = block;
+
+  printf("[dealloc] freed block at %p, new head=%p, size=%lu\n", block, head,
+         size);
+}
+
+void printinfo() {
+  struct header *block = head;
+  while (block != NULL) {
+    printf("[printinfo] block: %p, block size: %lu, block next: %p\n", block,
+           block->size, block->next);
+    block = block->next;
+  }
+}
+
+void resetalloc() {
+  if (heap_origin == NULL)
+    return;
+  printf("resetting\n");
+  void *current = sbrk(0);
+  intptr_t diff = (char *)current - (char *)heap_origin;
+
+  if (diff > 0)
+    sbrk(-diff); // shrink heap back
+
+  heap_origin = NULL;
+  heap_end = NULL;
+  head = NULL;
+  deallocCalled = false;
+}
+
+// --- allocopt(): create one big allocatable region ---
+void allocopt(enum algs algopt, int size) {
+  resetalloc(); // clean any previous region
+  algs = algopt;
+  heap_origin = sbrk(0);             // current break (start)
+  struct header *block = sbrk(size); // grow heap by `size` bytes
+
+  if (block == (void *)-1) {
+    perror("sbrk failed");
+    exit(1);
+  }
+
+  // initialize the "head" region
+  block->size = size - sizeof(struct header);
+  block->next = NULL;
+
+  head = block;
+  heap_end = (char *)heap_origin + size;
+
+  printf("[allocopt] heap_origin=%p heap_end=%p head=%p\n", heap_origin,
+         heap_end, head);
+}
+struct allocinfo allocinfo();

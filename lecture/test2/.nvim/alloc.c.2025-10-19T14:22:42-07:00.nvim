@@ -1,0 +1,277 @@
+#define _DEFAULT_SOURCE
+#include "alloc.h"
+#include <unistd.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+
+#define HEADER_SIZE (sizeof(struct header))
+
+/* Free-list head. For free blocks, header->size = usable bytes (excluding header). */
+/* For allocated blocks (while allocated), header->size = total chunk size (payload + header). */
+static struct header *free_list = NULL;
+
+/* Current allocation algorithm and heap growth limit (in bytes). */
+static enum algs current_alg = FIRST_FIT;
+static int heap_limit = 0; /* 0 means no limit specified yet (treated as unlimited). */
+
+/* Remember the initial program break so we can enforce the limit set by allocopt. */
+static void *heap_start = NULL;
+
+/* Helpers --------------------------------------------------------------- */
+
+/* Return current program break */
+static void *cur_brk(void) {
+  return sbrk(0);
+}
+
+/* Append a newly-obtained sbrk(INCREMENT) region as a single free block.
+ * Returns pointer to the new free block header, or NULL if can't grow due to limit. */
+static struct header *add_heap_region(void) {
+  void *old_brk = cur_brk();
+  if (heap_start == NULL) {
+    heap_start = old_brk;
+  }
+
+  /* Enforce heap_limit if set (heap_limit == 0 => no limit) */
+  if (heap_limit > 0) {
+    /* If growing by INCREMENT would exceed heap_start + heap_limit, refuse. */
+    intptr_t used_after_growth = (intptr_t)old_brk - (intptr_t)heap_start + INCREMENT;
+    if (used_after_growth > heap_limit) {
+      return NULL;
+    }
+  }
+
+  void *res = sbrk(INCREMENT);
+  if (res == (void *)-1) {
+    return NULL;
+  }
+
+  /* Create a free block header at old_brk */
+  struct header *h = (struct header *)old_brk;
+  h->next = NULL;
+  /* free block's size field stores usable payload bytes (excluding header) */
+  h->size = (uint64_t)(INCREMENT - HEADER_SIZE);
+
+  /* Insert new region at the end of the free list for simplicity */
+  if (free_list == NULL) {
+    free_list = h;
+  } else {
+    struct header *curr = free_list;
+    while (curr->next != NULL) curr = curr->next;
+    curr->next = h;
+  }
+  return h;
+}
+
+/* Find a suitable free block according to current_alg.
+ * needed = requested payload size + HEADER_SIZE (we need this many bytes out of a free block's usable bytes).
+ * prev_out is set to the previous pointer in free list (or NULL if block is head). */
+static struct header *find_suitable_block(uint64_t needed, struct header **prev_out) {
+  struct header *prev = NULL;
+  struct header *curr = free_list;
+  struct header *best = NULL;
+  struct header *best_prev = NULL;
+
+  while (curr != NULL) {
+    if (curr->size >= needed) {
+      if (current_alg == FIRST_FIT) {
+        *prev_out = prev;
+        return curr;
+      } else if (current_alg == BEST_FIT) {
+        if (best == NULL || curr->size < best->size) {
+          best = curr;
+          best_prev = prev;
+        }
+      } else if (current_alg == WORST_FIT) {
+        if (best == NULL || curr->size > best->size) {
+          best = curr;
+          best_prev = prev;
+        }
+      }
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+
+  *prev_out = best_prev;
+  return best;
+}
+
+/* Remove 'block' from free_list; prev is its previous node (or NULL if head) */
+static void remove_free_block(struct header *prev, struct header *block) {
+  if (prev == NULL) {
+    free_list = block->next;
+  } else {
+    prev->next = block->next;
+  }
+  block->next = NULL;
+}
+
+/* Insert a free block into the free list, keeping the list sorted by address.
+ * The block->size should be usable bytes (excluding header). */
+static void insert_free_block_sorted(struct header *block) {
+  if (free_list == NULL || (void *)block < (void *)free_list) {
+    block->next = free_list;
+    free_list = block;
+    return;
+  }
+
+  struct header *curr = free_list;
+  while (curr->next != NULL && (void *)curr->next < (void *)block) {
+    curr = curr->next;
+  }
+  block->next = curr->next;
+  curr->next = block;
+}
+
+/* Try to coalesce adjacent free blocks — free_list must be address-ordered for correctness. */
+static void coalesce_free_list(void) {
+  if (free_list == NULL) return;
+  struct header *curr = free_list;
+  while (curr != NULL && curr->next != NULL) {
+    uint8_t *curr_end = (uint8_t *)curr + HEADER_SIZE + (size_t)curr->size;
+    if (curr_end == (uint8_t *)curr->next) {
+      /* adjacent: merge */
+      curr->size = curr->size + HEADER_SIZE + curr->next->size;
+      curr->next = curr->next->next;
+    } else {
+      curr = curr->next;
+    }
+  }
+}
+
+/* Public API ----------------------------------------------------------- */
+
+void allocopt(enum algs alg, int limit) {
+  current_alg = alg;
+  /* limit is the maximum total heap growth in bytes from the initial break.
+     Accept only positive values; zero disables the limit (treat as unlimited). */
+  if (limit > 0) {
+    heap_limit = limit;
+  } else {
+    heap_limit = 0;
+  }
+}
+
+/* Return allocation statistics. free_size counts only usable payload bytes across free blocks. */
+struct allocinfo allocinfo(void) {
+  struct allocinfo info;
+  info.free_size = 0;
+  info.free_chunks = 0;
+  info.largest_free_chunk_size = 0;
+  info.smallest_free_chunk_size = 0;
+
+  struct header *curr = free_list;
+  while (curr != NULL) {
+    info.free_size += curr->size;
+    info.free_chunks += 1;
+    if (info.largest_free_chunk_size == 0 || curr->size > info.largest_free_chunk_size)
+      info.largest_free_chunk_size = curr->size;
+    if (info.smallest_free_chunk_size == 0 || curr->size < info.smallest_free_chunk_size)
+      info.smallest_free_chunk_size = curr->size;
+    curr = curr->next;
+  }
+
+  return info;
+}
+
+void *alloc(int size) {
+  if (size <= 0) return NULL;
+  uint64_t need = (uint64_t)size + (uint64_t)HEADER_SIZE; /* bytes consumed out of a free block's usable area */
+
+  /* Ensure we have a free_list entry; if not, try to grow once. */
+  if (free_list == NULL) {
+    if (add_heap_region() == NULL) {
+      return NULL;
+    }
+  }
+
+  struct header *prev = NULL;
+  struct header *block = find_suitable_block(need, &prev);
+
+  /* If none found, try to grow the heap until we can satisfy or limit reached. */
+  while (block == NULL) {
+    struct header *newreg = add_heap_region();
+    if (newreg == NULL) break;
+    /* maybe the newly added region is suitable; search again */
+    block = find_suitable_block(need, &prev);
+  }
+
+  if (block == NULL) {
+    return NULL; /* out of memory / cannot grow */
+  }
+
+  /* If block->size exactly equals need, allocate whole block (remove from free list)
+     If block->size > need, split: allocate head portion, leave remainder as free block. */
+
+  if (block->size < need) {
+    /* Shouldn't happen due to selection; safe-check */
+    return NULL;
+  }
+
+  if (block->size == need) {
+    /* exact: remove from free list and mark allocated header->size as total chunk size */
+    remove_free_block(prev, block);
+    /* store allocated total in header->size (payload + header), as tests expect */
+    block->size = need; /* store total chunk size (payload + header) */
+    /* returned pointer is after header */
+    return (void *)((uint8_t *)block + HEADER_SIZE);
+  } else {
+    /* split block:
+       - allocated header at block address (overwrite block->size)
+       - leftover free header placed after allocated chunk
+       Note: free blocks store usable bytes, allocated header stores total chunk size.
+    */
+    uint8_t *alloc_addr = (uint8_t *)block;
+    struct header *alloc_h = (struct header *)alloc_addr;
+    uint8_t *leftover_addr = alloc_addr + (size_t)need;
+    struct header *left_h = (struct header *)leftover_addr;
+
+    /* left_h becomes free block; its usable size is old_size - need */
+    uint64_t old_usable = block->size;
+    uint64_t leftover_usable = old_usable - need;
+
+    left_h->size = leftover_usable; /* usable bytes */
+    left_h->next = block->next;
+
+    /* Patch free list links:
+       If block was head, replace head with left_h; else link prev->next = left_h */
+    if (prev == NULL) {
+      free_list = left_h;
+    } else {
+      prev->next = left_h;
+    }
+
+    /* Allocated header stores total chunk size (payload + header) as tests expect */
+    alloc_h->size = need;
+
+    /* allocated block's next pointer is undefined / unused; leave as-is */
+    return (void *)((uint8_t *)alloc_h + HEADER_SIZE);
+  }
+}
+
+void dealloc(void *ptr) {
+  if (ptr == NULL) return;
+
+  /* header for allocated block is just HEADER_SIZE bytes before ptr */
+  struct header *h = (struct header *)((uint8_t *)ptr - HEADER_SIZE);
+  uint64_t stored = h->size; /* stored is total chunk size (payload + header) */
+  if (stored < HEADER_SIZE) {
+    /* corrupted or invalid pointer; ignore gracefully */
+    return;
+  }
+
+  /* convert to free block usable size = stored - HEADER_SIZE */
+  struct header *free_h = h;
+  free_h->size = stored - HEADER_SIZE;
+  free_h->next = NULL;
+
+  /* Insert into free list sorted by address and coalesce */
+  insert_free_block_sorted(free_h);
+  coalesce_free_list();
+}
+

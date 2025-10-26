@@ -1,0 +1,145 @@
+#include "alloc.h"
+#include <stdio.h>
+#include <string.h>
+
+#define HEAP_SIZE 4096  // Simulated heap size for demo purposes
+
+static uint8_t heap[HEAP_SIZE];
+static struct header *free_list = NULL;
+static enum algs current_alg = FIRST_FIT;
+static int size_limit = HEAP_SIZE;
+
+// -------------------------------------------------------------
+// Helper functions
+// -------------------------------------------------------------
+
+static void init_heap(void) {
+    if (free_list == NULL) {
+        free_list = (struct header *)heap;
+        free_list->size = HEAP_SIZE - sizeof(struct header);
+        free_list->next = NULL;
+    }
+}
+
+// Merge consecutive free blocks (coalescing)
+static void coalesce() {
+    struct header *curr = free_list;
+    while (curr && curr->next) {
+        uint8_t *end_of_curr = (uint8_t *)curr + sizeof(struct header) + curr->size;
+        if (end_of_curr == (uint8_t *)curr->next) {
+            curr->size += sizeof(struct header) + curr->next->size;
+            curr->next = curr->next->next;
+        } else {
+            curr = curr->next;
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// Allocation strategies
+// -------------------------------------------------------------
+
+static struct header **find_block(int size) {
+    struct header **best = NULL;
+    struct header **curr = &free_list;
+
+    while (*curr) {
+        if ((*curr)->size >= (uint64_t)size) {
+            if (current_alg == FIRST_FIT) return curr;
+
+            if (current_alg == BEST_FIT) {
+                if (!best || (*curr)->size < (*best)->size) best = curr;
+            } else if (current_alg == WORST_FIT) {
+                if (!best || (*curr)->size > (*best)->size) best = curr;
+            }
+        }
+        curr = &(*curr)->next;
+    }
+    return best;
+}
+
+// -------------------------------------------------------------
+// API Implementations
+// -------------------------------------------------------------
+
+void *alloc(int size) {
+    if (size <= 0 || size > size_limit) return NULL;
+    init_heap();
+
+    struct header **block_ptr = find_block(size);
+    if (!block_ptr || !*block_ptr) return NULL;
+
+    struct header *block = *block_ptr;
+    int total_size = size + sizeof(struct header);
+
+    if (block->size > (uint64_t)(size + sizeof(struct header))) {
+        // Split block
+        struct header *new_block = (struct header *)((uint8_t *)block + total_size);
+        new_block->size = block->size - total_size;
+        new_block->next = block->next;
+        block->size = size;
+        *block_ptr = new_block;
+    } else {
+        // Use entire block
+        *block_ptr = block->next;
+    }
+
+    return (uint8_t *)block + sizeof(struct header);
+}
+
+void dealloc(void *ptr) {
+    if (!ptr) return;
+    struct header *block = (struct header *)((uint8_t *)ptr - sizeof(struct header));
+
+    if (!free_list) {
+        free_list = block;
+        block->next = NULL;
+        return;
+    }
+
+    // Insert block in sorted order
+    struct header *curr = free_list;
+    struct header *prev = NULL;
+
+    while (curr && curr < block) {
+        prev = curr;
+        curr = curr->next;
+    }
+
+    block->next = curr;
+    if (prev) prev->next = block;
+    else free_list = block;
+
+    coalesce();
+}
+
+void allocopt(enum algs alg, int limit) {
+    current_alg = alg;
+    if (limit > 0 && limit <= HEAP_SIZE) size_limit = limit;
+}
+
+struct allocinfo allocinfo(void) {
+    struct allocinfo info = {0};
+
+    struct header *curr = free_list;
+    if (!curr) return info;
+
+    info.largest_free_chunk_size = 0;
+    info.smallest_free_chunk_size = UINT64_MAX;
+
+    while (curr) {
+        info.free_size += curr->size;
+        info.free_chunks++;
+        if (curr->size > info.largest_free_chunk_size)
+            info.largest_free_chunk_size = curr->size;
+        if (curr->size < info.smallest_free_chunk_size)
+            info.smallest_free_chunk_size = curr->size;
+        curr = curr->next;
+    }
+
+    if (info.free_chunks == 0)
+        info.smallest_free_chunk_size = 0;
+
+    return info;
+}
+

@@ -1,0 +1,46 @@
+#define _DEFAULT_SOURCE
+#include "alloc.h"
+#include <unistd.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+
+
+struct header *find_first_fit(struct header *free_list_ptr, uint64_t size) {
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size) {
+      return free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return NULL;
+}
+
+struct header *find_best_fit(struct header *free_list_ptr, uint64_t size) {
+  struct header* best_fit = NULL;
+  uint64_t best_fit_size = UINT64_MAX;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size < best_fit_size) {
+      best_fit_size = free_list_ptr->size;
+      best_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return best_fit;
+}
+
+struct header *find_worst_fit(struct header *free_list_ptr, uint64_t size) {
+  struct header* worst_fit = NULL;
+  uint64_t worst_fit_size = 0;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size > worst_fit_size) {
+      worst_fit_size = free_list_ptr->size;
+      worst_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return worst_fit;
+}

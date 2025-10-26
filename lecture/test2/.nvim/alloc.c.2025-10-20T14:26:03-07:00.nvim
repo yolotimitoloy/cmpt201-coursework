@@ -1,0 +1,146 @@
+#define _DEFAULT_SOURCE
+#include <stdint.h>
+#include <string.h>
+#include <stddef.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "alloc.h"
+
+static struct header *free_list = NULL;
+static void *heap_origin = NULL;
+static enum algs algs = FIRST_FIT;
+
+
+struct header *find_first_fit(struct header *free_list_ptr, uint64_t size) {
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size) {
+      return free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return NULL;
+}
+struct header *find_first_fit_next(struct header *free_list_ptr, uint64_t size) {
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size) {
+      return free_list_ptr->next;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return NULL;
+}
+struct header *find_best_fit(struct header *free_list_ptr, uint64_t size) {
+  struct header* best_fit = NULL;
+  uint64_t best_fit_size = UINT64_MAX;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size < best_fit_size) {
+      best_fit_size = free_list_ptr->size;
+      best_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return best_fit;
+}
+
+struct header *find_best_fit_next(struct header *free_list_ptr, uint64_t size) {
+  struct header* best_fit = NULL;
+  uint64_t best_fit_size = UINT64_MAX;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size < best_fit_size) {
+      best_fit_size = free_list_ptr->size;
+      best_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return best_fit -> next;
+}
+struct header *find_worst_fit(struct header *free_list_ptr, uint64_t size) {
+  struct header* worst_fit = NULL;
+  uint64_t worst_fit_size = 0;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size > worst_fit_size) {
+      worst_fit_size = free_list_ptr->size;
+      worst_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return worst_fit;
+}
+
+struct header *find_worst_fit_next(struct header *free_list_ptr, uint64_t size) {
+  struct header* worst_fit = NULL;
+  uint64_t worst_fit_size = 0;
+  while (free_list_ptr != NULL) {
+    if (free_list_ptr->size >= size && free_list_ptr->size > worst_fit_size) {
+      worst_fit_size = free_list_ptr->size;
+      worst_fit = free_list_ptr;
+    }
+    free_list_ptr = free_list_ptr->next;
+  }
+  return worst_fit->next;
+}
+void *alloc(int size){
+  if (heap_origin == NULL){
+    heap_origin = sbrk(0);
+  }
+  struct header *block = heap_origin;
+  struct header *nextBlock = NULL;
+  struct header *newBlock = NULL;
+  switch(algs){
+    case FIRST_FIT: 
+      block = find_first_fit(block, size); 
+      nextBlock = find_first_fit_next(block,size); 
+      break;
+    case BEST_FIT:
+      block = find_best_fit(block, size); 
+      nextBlock = find_best_fit_next(block,size); 
+      break;
+    case WORST_FIT:
+      block = find_worst_fit(block, size);
+      nextBlock = find_worst_fit_next(block,size); 
+      break;
+  }
+
+  if (block) {
+     block = sbrk(sizeof(struct header) + size);
+     if (block == (void*)-1){
+         return NULL;  
+     }
+     newBlock->size = block->size - sizeof(struct header) + size;
+     newBlock->next = nextBlock;
+     block->size = sizeof(struct header) + size;
+     block->next = newBlock;
+     memset(block + 1, 1, size); 
+  }
+  return block + 1; 
+
+}
+
+
+void dealloc(void * header);
+
+void reset(){
+    if (heap_origin == NULL)
+        return; 
+    void *current = sbrk(0);
+    intptr_t diff = (char*)current - (char*)heap_origin;
+    if (diff > 0)
+        sbrk(-diff);
+    free_list = NULL;
+}
+
+void allocopt(enum algs algsopt, int size){
+  reset();
+  heap_origin = sbrk(0);
+  algs = algsopt; 
+  struct header *block = sbrk(sizeof(struct header) + size);
+  block -> size = size;
+  block-> next = NULL;
+  memset(block + 1, 0 , size);
+
+
+};
+
+
+struct allocinfo allocinfo();
