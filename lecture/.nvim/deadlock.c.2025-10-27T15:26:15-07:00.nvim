@@ -1,0 +1,32 @@
+#include <pthread.h>
+#include <stdio.h>
+
+pthread_mutex_t locka = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t lockb = PTHREAD_MUTEX_INITIALIZER;
+
+static void *funca(void *arg) {
+  pthread_mutex_lock(&locka);
+  printf("inside of thread a\n");
+  pthread_mutex_lock(&lockb);
+  printf("inside of thread a lock b\n");
+  pthread_mutex_unlock(&lockb);
+  pthread_mutex_unlock(&locka);
+  pthread_exit(0);
+}
+static void *funcb(void *arg) {
+  pthread_mutex_lock(&lockb);
+  printf("inside of thread b\n");
+  pthread_mutex_lock(&locka);
+  printf("inside of thread b lock a\n");
+  pthread_mutex_unlock(&locka);
+  pthread_mutex_unlock(&lockb);
+  pthread_exit(0);
+}
+int main(int argc, char *argv[]) {
+  pthread_t t1;
+  pthread_create(&t1, NULL, funca, NULL);
+  pthread_t t2;
+  pthread_create(&t2, NULL, funcb, NULL);
+  pthread_join(t1, NULL);
+  pthread_join(t1, NULL);
+}

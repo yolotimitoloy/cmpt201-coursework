@@ -1,0 +1,18 @@
+#include <pthread.h>
+#include <stdio.h>
+
+
+pthread_mutex_t locka = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t lockb = PTHREAD_MUTEX_INITIALIZER;
+
+static void *func(void *arg){
+  printf("inside of thread\n"); 
+  pthread_exit(0);  
+}
+
+int main(int argc, char* argv[]){
+  pthread_t t1;
+  pthread_create(&t1, NULL, func, NULL);
+  pthread_join(t1, NULL);
+
+}
