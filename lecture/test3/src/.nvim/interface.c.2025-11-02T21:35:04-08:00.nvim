@@ -1,0 +1,182 @@
+#include "interface.h"
+#include "uthash.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+#define MAX_INTERMEDIATE 1024
+#define MAX_VALUES_PER_KEY 256
+
+
+pthread_mutex_t intermediate_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t final_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
+// -----------------------------
+// INTERMEDIATE STORAGE
+// -----------------------------
+static struct mr_out_kv intermediate[MAX_INTERMEDIATE];
+static size_t intermediate_count = 0;
+
+// -----------------------------
+// FINAL STORAGE (hash table)
+// -----------------------------
+struct final_kv {
+  char key[MAX_KEY_SIZE];
+  char (*value)[MAX_VALUE_SIZE];
+  size_t count;
+  UT_hash_handle hh;
+};
+
+static struct final_kv *final_table = NULL;
+
+// -----------------------------
+// HELPERS
+// -----------------------------
+static void init_intermediate() {
+  for (size_t i = 0; i < MAX_INTERMEDIATE; i++) {
+    intermediate[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    intermediate[i].count = 0;
+    intermediate[i].key[0] = '\0';
+  }
+}
+
+static struct mr_out_kv *find_or_create_sorted(struct mr_out_kv *list,
+                                               size_t *count, size_t max,
+                                               const char *key) {
+  for (size_t i = 0; i < *count; i++) {
+    if (strcmp(list[i].key, key) == 0)
+      return &list[i];
+  }
+
+  if (*count >= max)
+    return NULL;
+
+  size_t insert_idx = 0;
+  while (insert_idx < *count && strcmp(list[insert_idx].key, key) < 0)
+    insert_idx++;
+
+  for (size_t j = *count; j > insert_idx; j--)
+    list[j] = list[j - 1];
+
+  struct mr_out_kv *kv = &list[insert_idx];
+  strcpy(kv->key, key);
+  kv->count = 0;
+  (*count)++;
+  return kv;
+}
+
+// -----------------------------
+// EMIT FUNCTIONS
+// -----------------------------
+int mr_emit_i(const char *key, const char *value) {
+  struct mr_out_kv *kv = find_or_create_sorted(
+      intermediate, &intermediate_count, MAX_INTERMEDIATE, key);
+  if (!kv)
+    return -1;
+
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  return 0;
+}
+
+int mr_emit_f(const char *key, const char *value) {
+  struct final_kv *entry = NULL;
+  HASH_FIND_STR(final_table, key, entry);
+
+  if (!entry) {
+    entry = malloc(sizeof(struct final_kv));
+    if (!entry)
+      return -1;
+
+    strcpy(entry->key, key);
+    entry->count = 0;
+    entry->value = malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    if (!entry->value) {
+      free(entry);
+      return -1;
+    }
+    HASH_ADD_STR(final_table, key, entry);
+  }
+
+  strcpy(entry->value[entry->count], value);
+  entry->count++;
+
+  return 0;
+}
+
+// -----------------------------
+// COMPARE FOR SORTING HASH TABLE
+// -----------------------------
+int compare_final_kv(struct final_kv *a, struct final_kv *b) {
+  return strcmp(a->key, b->key);
+}
+
+// -----------------------------
+// EXEC PIPELINE
+// -----------------------------
+int mr_exec(const struct mr_input *input, void (*map)(const struct mr_in_kv *),
+            size_t mapper_count, void (*reduce)(const struct mr_out_kv *),
+            size_t reducer_count, struct mr_output *output) {
+
+  // initialize buffers
+  init_intermediate();
+  intermediate_count = 0;
+
+  // clear final table if any
+  struct final_kv *current, *tmp;
+  HASH_ITER(hh, final_table, current, tmp) {
+    HASH_DEL(final_table, current);
+    free(current->value);
+    free(current);
+  }
+
+  // -------------------------
+  // MAP PHASE
+  // -------------------------
+  for (size_t i = 0; i < input->count; i++) {
+    pthread_mutex_lock(&intermediate_mutex);
+    map(&input->kv_lst[i]);
+    pthread_mutex_unlock(&intermediate_mutex);
+  }
+
+  // -------------------------
+  // REDUCE PHASE
+  // -------------------------
+  for (size_t i = 0; i < intermediate_count; i++) {
+    pthread_mutex_lock(&final_mutex);
+    reduce(&intermediate[i]);
+    pthread_mutex_unlock(&final_mutex);
+
+  }
+
+  // -------------------------
+  // SORT FINAL TABLE BY KEY
+  // -------------------------
+  HASH_SORT(final_table, compare_final_kv);
+
+  // -------------------------
+  // WRITE OUTPUT
+  // -------------------------
+  size_t final_count = HASH_COUNT(final_table);
+  output->kv_lst = malloc(sizeof(struct mr_out_kv) * final_count);
+  output->count = final_count;
+
+  size_t idx = 0;
+  HASH_ITER(hh, final_table, current, tmp) {
+    strcpy(output->kv_lst[idx].key, current->key);
+    output->kv_lst[idx].count = current->count;
+    output->kv_lst[idx].value = current->value;
+
+    // print final outputs
+    for (size_t j = 0; j < current->count; j++) {
+      printf("Final Output: %s -> %s\n", current->key, current->value[j]);
+    }
+
+    idx++;
+  }
+
+  return 0;
+}

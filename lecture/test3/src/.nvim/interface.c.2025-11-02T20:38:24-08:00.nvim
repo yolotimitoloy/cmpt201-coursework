@@ -1,0 +1,146 @@
+#include "interface.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "uthash.h"
+
+#define MAX_INTERMEDIATE 1024
+#define MAX_OUTPUT 1024
+#define MAX_VALUES_PER_KEY 256
+#define MAX_KEY_SIZE 16
+#define MAX_VALUE_SIZE 16
+
+struct intermediate_kv {
+    char key[MAX_KEY_SIZE];
+    char values[100][MAX_VALUE_SIZE]; // up to 100 values per key
+    size_t count;
+    UT_hash_handle hh; // uthash handle
+};
+
+static struct intermediate_kv *intermediate_table = NULL;
+// -----------------------------
+// INTERMEDIATE STORAGE
+// -----------------------------
+static struct mr_out_kv intermediate[MAX_INTERMEDIATE];
+static size_t intermediate_count = 0;
+
+// -----------------------------
+// FINAL STORAGE
+// -----------------------------
+static struct mr_out_kv final_out[MAX_OUTPUT];
+static size_t final_count = 0;
+
+// -----------------------------
+// HELPER: ensure storage initialized
+// -----------------------------
+static void init_intermediate() {
+  for (size_t i = 0; i < MAX_INTERMEDIATE; i++) {
+    intermediate[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    intermediate[i].count = 0;
+    intermediate[i].key[0] = '\0';
+  }
+}
+
+static void init_final() {
+  for (size_t i = 0; i < MAX_OUTPUT; i++) {
+    final_out[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    final_out[i].count = 0;
+    final_out[i].key[0] = '\0';
+  }
+}
+
+// -----------------------------
+// FIND or CREATE KEY
+// -----------------------------
+static struct mr_out_kv *find_or_create(struct mr_out_kv *list, size_t *count,
+                                        size_t max, const char *key) {
+  // find existing
+  for (size_t i = 0; i < *count; i++) {
+    if (strcmp(list[i].key, key) == 0) {
+      return &list[i];
+    }
+  }
+
+  // else add new
+  if (*count >= max)
+    return NULL;
+
+  struct mr_out_kv *kv = &list[*count];
+  strcpy(kv->key, key);
+  kv->count = 0;
+  (*count)++;
+  return kv;
+}
+
+// -----------------------------
+// EMIT INTERMEDIATE
+// -----------------------------
+int mr_emit_i(const char *key, const char *value) {
+  struct mr_out_kv *kv =
+      find_or_create(intermediate, &intermediate_count, MAX_INTERMEDIATE, key);
+
+  if (!kv)
+    return -1;
+
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  return 0;
+}
+
+// -----------------------------
+// EMIT FINAL
+// -----------------------------
+int mr_emit_f(const char *key, const char *value) {
+  struct mr_out_kv *kv =
+      find_or_create(final_out, &final_count, MAX_OUTPUT, key);
+
+  if (!kv)
+    return -1;
+
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  return 0;
+}
+
+// -----------------------------
+// EXEC PIPELINE
+// -----------------------------
+int mr_exec(const struct mr_input *input, void (*map)(const struct mr_in_kv *),
+            size_t mapper_count, // (ignored: single-threaded version)
+            void (*reduce)(const struct mr_out_kv *),
+            size_t reducer_count, // (ignored)
+            struct mr_output *output) {
+  // initialize intermediate and final buffers
+  init_intermediate();
+  init_final();
+  intermediate_count = 0;
+  final_count = 0;
+
+  // -------------------------
+  // MAP PHASE
+  // -------------------------
+  for (size_t i = 0; i < input->count; i++) {
+    map(&input->kv_lst[i]);
+  }
+
+  // -------------------------
+  // REDUCE PHASE
+  // -------------------------
+  for (size_t i = 0; i < intermediate_count; i++) {
+    reduce(&intermediate[i]);
+  }
+
+  // -------------------------
+  // WRITE OUTPUT
+  // -------------------------
+  output->kv_lst = malloc(sizeof(struct mr_out_kv) * final_count);
+  output->count = final_count;
+
+  for (size_t i = 0; i < final_count; i++) {
+    output->kv_lst[i] = final_out[i];
+  }
+
+  return 0;
+}

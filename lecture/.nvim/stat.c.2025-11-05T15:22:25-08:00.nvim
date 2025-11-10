@@ -1,0 +1,55 @@
+#define _POSIX_C_SOURCE 200809L
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(int argc, char *argv[]) {
+  char *path = argv[1];
+  char paths[1000];
+  getcwd(paths, 1000);
+  struct stat st;
+  printf("%s\n", paths);
+  stat(paths, &st);
+  if (S_ISREG(st.st_mode)) {
+    printf("regular file\n");
+  } else if (S_ISDIR(st.st_mode)) {
+    printf("Directory\n");
+  } else {
+    printf("unknown\n");
+  }
+  /*
+  char buf[] = "lecture";
+  // getcwd(buf, 1000);
+  struct stat sd;
+  stat(buf, &sd);
+  printf("%s", buf);
+  printf("\n");
+  switch (sd.st_mode) {
+  case S_IFBLK:
+    printf("block device\n");
+    break;
+  case S_IFCHR:
+    printf("character device\n");
+    break;
+  case S_IFDIR:
+    printf("directory\n");
+    break;
+  case S_IFIFO:
+    printf("FIFO/pipe\n");
+    break;
+  case S_IFLNK:
+    printf("symlink\n");
+    break;
+  case S_IFREG:
+    printf("regular file\n");
+    break;
+  case S_IFSOCK:
+    printf("socket\n");
+    break;
+  default:
+    printf("unknown?\n");
+    break;
+  }
+  */
+}

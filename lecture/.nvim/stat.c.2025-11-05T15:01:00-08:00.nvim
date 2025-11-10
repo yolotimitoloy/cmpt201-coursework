@@ -1,0 +1,11 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main() {
+  char buf[1000];
+  getcwd(buf, 1000);
+  
+  printf(buf);
+  printf("\n");
+}

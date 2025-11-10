@@ -1,0 +1,170 @@
+#include "interface.h"
+#include "uthash.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_INTERMEDIATE 1024
+#define MAX_OUTPUT 1024
+#define MAX_VALUES_PER_KEY 256
+
+// -----------------------------
+// INTERMEDIATE STORAGE
+// -----------------------------
+static struct mr_out_kv intermediate[MAX_INTERMEDIATE];
+static size_t intermediate_count = 0;
+
+// -----------------------------
+// FINAL STORAGE
+// -----------------------------
+static struct mr_out_kv final_out[MAX_OUTPUT];
+static size_t final_count = 0;
+
+struct final_kv {
+  char key[MAX_KEY_SIZE];
+  char (*value)[MAX_VALUE_SIZE];
+  size_t count;
+  UT_hash_handle hh;
+};
+
+static struct final_kv *final_table = NULL; // hash table for final output
+
+// -----------------------------
+// HELPER: ensure storage initialized
+// -----------------------------
+static void init_intermediate() {
+  for (size_t i = 0; i < MAX_INTERMEDIATE; i++) {
+    intermediate[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    intermediate[i].count = 0;
+    intermediate[i].key[0] = '\0';
+  }
+}
+
+static void init_final() {
+  for (size_t i = 0; i < MAX_OUTPUT; i++) {
+    final_out[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    final_out[i].count = 0;
+    final_out[i].key[0] = '\0';
+  }
+}
+
+// -----------------------------
+// FIND or CREATE KEY
+// -----------------------------
+static struct mr_out_kv *find_or_create(struct mr_out_kv *list, size_t *count,
+                                        size_t max, const char *key) {
+  // find existing
+  for (size_t i = 0; i < *count; i++) {
+    if (strcmp(list[i].key, key) == 0) {
+      return &list[i];
+    }
+  }
+
+  // else add new
+  if (*count >= max)
+    return NULL;
+
+  struct mr_out_kv *kv = &list[*count];
+  strcpy(kv->key, key);
+  kv->count = 0;
+  (*count)++;
+  return kv;
+}
+
+// -----------------------------
+// EMIT INTERMEDIATE
+// -----------------------------
+int mr_emit_i(const char *key, const char *value) {
+  struct mr_out_kv *kv =
+      find_or_create(intermediate, &intermediate_count, MAX_INTERMEDIATE, key);
+
+  if (!kv)
+    return -1;
+
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  return 0;
+}
+
+// -----------------------------
+// EMIT FINAL
+// -----------------------------
+int mr_emit_f(const char *key, const char *value) {
+  struct final_kv *entry = NULL;
+  HASH_FIND_STR(final_table, key, entry);
+
+  if (!entry) {
+    entry = malloc(sizeof(struct final_kv));
+    if (!entry)
+      return -1;
+
+    strcpy(entry->key, key);
+    entry->count = 0;
+    entry->value = malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    if (!entry->value) {
+      free(entry);
+      return -1;
+    }
+
+    HASH_ADD_STR(final_table, key, entry);
+  }
+
+  strcpy(entry->value[entry->count], value);
+  entry->count++;
+
+  //printf("Final Output: %s -> %s\n", key, value);
+
+  return 0;
+}
+
+int compare_mr_out_kv(const void *a, const void *b) {
+  const struct mr_out_kv *kv1 = (const struct mr_out_kv *)a;
+  const struct mr_out_kv *kv2 = (const struct mr_out_kv *)b;
+  return strcmp(kv1->key, kv2->key);
+}
+
+// -----------------------------
+// EXEC PIPELINE
+// -----------------------------
+int mr_exec(const struct mr_input *input, void (*map)(const struct mr_in_kv *),
+            size_t mapper_count, // (ignored: single-threaded version)
+            void (*reduce)(const struct mr_out_kv *),
+            size_t reducer_count, // (ignored)
+            struct mr_output *output) {
+  // initialize intermediate and final buffers
+  init_intermediate();
+  init_final();
+  intermediate_count = 0;
+  final_count = 0;
+
+  // -------------------------
+  // MAP PHASE
+  // -------------------------
+  for (size_t i = 0; i < input->count; i++) {
+    map(&input->kv_lst[i]);
+  }
+
+  // -------------------------
+  // REDUCE PHASE
+  // -------------------------
+  for (size_t i = 0; i < intermediate_count; i++) {
+    reduce(&intermediate[i]);
+  }
+
+  qsort(final_out, final_count, sizeof(struct mr_out_kv), compare_mr_out_kv);
+
+  // -------------------------
+  // WRITE OUTPUT
+  // -------------------------
+  output->kv_lst = malloc(sizeof(struct mr_out_kv) * final_count);
+  output->count = final_count;
+
+  for (size_t i = 0; i < final_count; i++) {
+    output->kv_lst[i] = final_out[i];
+    printf("Final Output: %s -> %s\n", final_out[i].key, *final_out[i].value);
+  }
+
+  return 0;
+}

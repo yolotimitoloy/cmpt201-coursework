@@ -1,0 +1,16 @@
+CC = clang
+CFLAGS = -Wall -Wextra -g
+OBJ = free_output.o main.o number_of_mappers_reducers.o single_map.o test.o \
+      map_and_reduce.o partition.o single_reduce.o
+DEPS = interface.h tests.h
+
+all: main
+
+%.o: %.c $(DEPS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+main: $(OBJ)
+	$(CC) $(CFLAGS) $(OBJ) -o main
+
+clean:
+	rm -f *.o main

@@ -1,0 +1,554 @@
+#include "interface.h"
+/*
+// Executes the map-reduce framework
+// Blocks until the map-reduce framework is done
+// Returns 0 on success, -1 on failure
+int mr_exec(const struct mr_input *input,         // input key-value pairs
+            void (*map)(const struct mr_in_kv *), // map function
+            size_t mapper_count,                  // number of mappers (threads)
+            void (*reduce)(const struct mr_out_kv *), // reduce function
+            size_t reducer_count,    // number of reducers (threads)
+            struct mr_output *output // pointer to a final output buffer
+) {
+
+
+
+  return 0;
+}
+
+int mr_emit_i(const char *key, const char *value) { return 0; }
+
+
+
+int mr_emit_f(const char *key, const char *value) { return 0; }
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_INTERMEDIATE 1024
+#define MAX_OUTPUT 1024
+#define MAX_VALUES_PER_KEY 256
+
+// -----------------------------
+// INTERMEDIATE STORAGE
+// -----------------------------
+static struct mr_out_kv intermediate[MAX_INTERMEDIATE];
+static size_t intermediate_count = 0;
+
+// -----------------------------
+// FINAL STORAGE
+// -----------------------------
+static struct mr_out_kv final_out[MAX_OUTPUT];
+static size_t final_count = 0;
+
+// -----------------------------
+// HELPER: ensure storage initialized
+// -----------------------------
+static void init_intermediate() {
+  for (size_t i = 0; i < MAX_INTERMEDIATE; i++) {
+    intermediate[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    intermediate[i].count = 0;
+    intermediate[i].key[0] = '\0';
+  }
+}
+
+static void init_final() {
+  for (size_t i = 0; i < MAX_OUTPUT; i++) {
+    final_out[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    final_out[i].count = 0;
+    final_out[i].key[0] = '\0';
+  }
+}
+
+// -----------------------------
+// FIND or CREATE KEY
+// -----------------------------
+static struct mr_out_kv *find_or_create(struct mr_out_kv *list, size_t *count,
+                                        size_t max, const char *key) {
+  // find existing
+  for (size_t i = 0; i < *count; i++) {
+    if (strcmp(list[i].key, key) == 0) {
+      return &list[i];
+    }
+  }
+
+  // else add new
+  if (*count >= max)
+    return NULL;
+
+  struct mr_out_kv *kv = &list[*count];
+  strcpy(kv->key, key);
+  kv->count = 0;
+  (*count)++;
+  return kv;
+}
+
+// -----------------------------
+// EMIT INTERMEDIATE
+// -----------------------------
+int mr_emit_i(const char *key, const char *value) {
+  struct mr_out_kv *kv =
+      find_or_create(intermediate, &intermediate_count, MAX_INTERMEDIATE, key);
+
+  if (!kv)
+    return -1;
+
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  return 0;
+}
+
+// -----------------------------
+// EMIT FINAL
+// -----------------------------
+int mr_emit_f(const char *key, const char *value) {
+  struct mr_out_kv *kv =
+      find_or_create(final_out, &final_count, MAX_OUTPUT, key);
+
+  if (!kv)
+    return -1;
+
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  return 0;
+}
+
+// -----------------------------
+// EXEC PIPELINE
+// -----------------------------
+int mr_exec(const struct mr_input *input, void (*map)(const struct mr_in_kv *),
+            size_t mapper_count, // (ignored: single-threaded version)
+            void (*reduce)(const struct mr_out_kv *),
+            size_t reducer_count, // (ignored)
+            struct mr_output *output) {
+  // initialize intermediate and final buffers
+  init_intermediate();
+  init_final();
+  intermediate_count = 0;
+  final_count = 0;
+
+  // -------------------------
+  // MAP PHASE
+  // -------------------------
+  for (size_t i = 0; i < input->count; i++) {
+    map(&input->kv_lst[i]);
+  }
+
+  // -------------------------
+  // REDUCE PHASE
+  // -------------------------
+  for (size_t i = 0; i < intermediate_count; i++) {
+    reduce(&intermediate[i]);
+  }
+
+  // -------------------------
+  // WRITE OUTPUT
+  // -------------------------
+  output->kv_lst = malloc(sizeof(struct mr_out_kv) * final_count);
+  output->count = final_count;
+
+  for (size_t i = 0; i < final_count; i++) {
+    output->kv_lst[i] = final_out[i];
+  }
+
+  return 0;
+}
+*/
+// mr.c
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+
+#define MAX_INTERMEDIATE_PAIRS 65536
+#define MAX_FINAL_KV 65536
+
+/* ---------- Intermediate pair storage (flat list of key/value pairs) ---------- */
+
+typedef struct {
+    char key[MAX_KEY_SIZE];
+    char value[MAX_VALUE_SIZE];
+} intermediate_pair_t;
+
+static intermediate_pair_t *intermediate_pairs;
+static size_t intermediate_pairs_cap = 0;
+static size_t intermediate_pairs_count = 0;
+
+static pthread_mutex_t emit_i_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* grow intermediate buffer if needed */
+static int ensure_intermediate_capacity(void) {
+    if (!intermediate_pairs) {
+        intermediate_pairs_cap = 4096;
+        intermediate_pairs = malloc(intermediate_pairs_cap * sizeof(*intermediate_pairs));
+        return intermediate_pairs ? 0 : -1;
+    }
+    if (intermediate_pairs_count >= intermediate_pairs_cap) {
+        size_t newcap = intermediate_pairs_cap * 2;
+        intermediate_pair_t *tmp = realloc(intermediate_pairs, newcap * sizeof(*tmp));
+        if (!tmp) return -1;
+        intermediate_pairs = tmp;
+        intermediate_pairs_cap = newcap;
+    }
+    return 0;
+}
+
+/* Called by map() functions concurrently */
+int mr_emit_i(const char *key, const char *value) {
+    if (!key || !value) return -1;
+    if (pthread_mutex_lock(&emit_i_mutex) != 0) return -1;
+
+    if (ensure_intermediate_capacity() != 0) {
+        pthread_mutex_unlock(&emit_i_mutex);
+        return -1;
+    }
+
+    strncpy(intermediate_pairs[intermediate_pairs_count].key, key, MAX_KEY_SIZE-1);
+    intermediate_pairs[intermediate_pairs_count].key[MAX_KEY_SIZE-1] = '\0';
+    strncpy(intermediate_pairs[intermediate_pairs_count].value, value, MAX_VALUE_SIZE-1);
+    intermediate_pairs[intermediate_pairs_count].value[MAX_VALUE_SIZE-1] = '\0';
+    intermediate_pairs_count++;
+
+    pthread_mutex_unlock(&emit_i_mutex);
+    return 0;
+}
+
+/* ---------- Final output storage ---------- */
+
+static struct mr_out_kv *final_out = NULL;
+static size_t final_out_cap = 0;
+static size_t final_out_count = 0;
+static pthread_mutex_t emit_f_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* helper to find/create final kv (thread-safe caller must hold mutex) */
+static struct mr_out_kv *find_or_create_final(const char *key) {
+    for (size_t i = 0; i < final_out_count; ++i) {
+        if (strcmp(final_out[i].key, key) == 0) return &final_out[i];
+    }
+    if (final_out_count >= final_out_cap) return NULL;
+
+    struct mr_out_kv *kv = &final_out[final_out_count++];
+    strncpy(kv->key, key, MAX_KEY_SIZE-1);
+    kv->key[MAX_KEY_SIZE-1] = '\0';
+    kv->count = 0;
+    /* value pointer will point to a preallocated 2D block (see init_final) */
+    return kv;
+}
+
+/* ensure final_out has capacity */
+static int ensure_final_capacity(void) {
+    if (!final_out) {
+        final_out_cap = 1024;
+        final_out = calloc(final_out_cap, sizeof(*final_out));
+        if (!final_out) return -1;
+        /* allocate per-entry value buffers lazily (on-demand) in find_or_create_final later */
+    }
+    if (final_out_count >= final_out_cap) {
+        size_t newcap = final_out_cap * 2;
+        struct mr_out_kv *tmp = realloc(final_out, newcap * sizeof(*tmp));
+        if (!tmp) return -1;
+        final_out = tmp;
+        final_out_cap = newcap;
+    }
+    return 0;
+}
+
+/* Called by reduce() functions concurrently */
+int mr_emit_f(const char *key, const char *value) {
+    if (!key || !value) return -1;
+
+    if (pthread_mutex_lock(&emit_f_mutex) != 0) return -1;
+
+    if (ensure_final_capacity() != 0) {
+        pthread_mutex_unlock(&emit_f_mutex);
+        return -1;
+    }
+
+    /* find or create final key entry */
+    struct mr_out_kv *kv = NULL;
+    for (size_t i = 0; i < final_out_count; ++i) {
+        if (strcmp(final_out[i].key, key) == 0) { kv = &final_out[i]; break; }
+    }
+    if (!kv) {
+        /* create */
+        kv = &final_out[final_out_count++];
+        strncpy(kv->key, key, MAX_KEY_SIZE-1);
+        kv->key[MAX_KEY_SIZE-1] = '\0';
+        kv->count = 0;
+        /* allocate initial value array block */
+        kv->value = malloc(sizeof(char[16][MAX_VALUE_SIZE]));
+        if (!kv->value) {
+            pthread_mutex_unlock(&emit_f_mutex);
+            return -1;
+        }
+    }
+
+    /* ensure we have space for another value in kv->value - we'll realloc as necessary */
+    size_t cur_count = kv->count;
+    /* count how many slots allocated: we approximate by reallocing to cur_count+1 */
+    char (*newarr)[MAX_VALUE_SIZE] = realloc(kv->value, sizeof(char[cur_count + 1][MAX_VALUE_SIZE]));
+    if (!newarr) {
+        pthread_mutex_unlock(&emit_f_mutex);
+        return -1;
+    }
+    kv->value = newarr;
+    strncpy(kv->value[kv->count], value, MAX_VALUE_SIZE-1);
+    kv->value[kv->count][MAX_VALUE_SIZE-1] = '\0';
+    kv->count++;
+
+    pthread_mutex_unlock(&emit_f_mutex);
+    return 0;
+}
+
+/* ---------- Utilities: sorting intermediate pairs by key ---------- */
+
+static int cmp_intermediate_pairs(const void *a, const void *b) {
+    const intermediate_pair_t *pa = a;
+    const intermediate_pair_t *pb = b;
+    int r = strcmp(pa->key, pb->key);
+    if (r != 0) return r;
+    return strcmp(pa->value, pb->value);
+}
+
+/* ---------- Grouping: convert flat intermediate list -> list of mr_out_kv groups ---------- */
+
+static struct mr_out_kv *group_intermediate(size_t *out_group_count) {
+    *out_group_count = 0;
+    if (intermediate_pairs_count == 0) return NULL;
+
+    /* sort pairs by key so equal keys are contiguous */
+    qsort(intermediate_pairs, intermediate_pairs_count, sizeof(intermediate_pairs[0]), cmp_intermediate_pairs);
+
+    /* allocate a list of mr_out_kv groups (max = intermediate_pairs_count) */
+    struct mr_out_kv *groups = malloc(sizeof(struct mr_out_kv) * intermediate_pairs_count);
+    if (!groups) return NULL;
+
+    size_t g = 0;
+    size_t idx = 0;
+    while (idx < intermediate_pairs_count) {
+        const char *key = intermediate_pairs[idx].key;
+        /* count values for this key */
+        size_t start = idx;
+        size_t cnt = 0;
+        while (idx < intermediate_pairs_count && strcmp(intermediate_pairs[idx].key, key) == 0) {
+            ++cnt;
+            ++idx;
+        }
+        /* initialize group */
+        strncpy(groups[g].key, key, MAX_KEY_SIZE-1);
+        groups[g].key[MAX_KEY_SIZE-1] = '\0';
+        groups[g].count = cnt;
+        /* allocate value array exactly cnt rows */
+        groups[g].value = malloc(sizeof(char[cnt][MAX_VALUE_SIZE]));
+        if (!groups[g].value) {
+            /* cleanup on error */
+            for (size_t j = 0; j < g; ++j) free(groups[j].value);
+            free(groups);
+            return NULL;
+        }
+        /* copy values into group */
+        for (size_t j = 0; j < cnt; ++j) {
+            strncpy(groups[g].value[j], intermediate_pairs[start + j].value, MAX_VALUE_SIZE-1);
+            groups[g].value[j][MAX_VALUE_SIZE-1] = '\0';
+        }
+        ++g;
+    }
+    *out_group_count = g;
+    return groups;
+}
+
+/* ---------- Threaded map execution ---------- */
+
+/* structure for mapper threads */
+typedef struct {
+    const struct mr_in_kv *input_arr;
+    size_t input_count;
+    size_t *next_index; /* shared index */
+    pthread_mutex_t *index_mutex;
+    void (*map_fn)(const struct mr_in_kv *);
+} mapper_args_t;
+
+static void *mapper_thread(void *arg) {
+    mapper_args_t *a = arg;
+    while (1) {
+        /* get next index */
+        if (pthread_mutex_lock(a->index_mutex) != 0) break;
+        size_t i = *(a->next_index);
+        if (i >= a->input_count) {
+            pthread_mutex_unlock(a->index_mutex);
+            break;
+        }
+        (*(a->next_index))++;
+        pthread_mutex_unlock(a->index_mutex);
+
+        /* call user map on input i */
+        a->map_fn(&a->input_arr[i]);
+    }
+    return NULL;
+}
+
+/* structure for reducer threads */
+typedef struct {
+    struct mr_out_kv *groups;
+    size_t start_idx;
+    size_t end_idx; /* exclusive */
+    void (*reduce_fn)(const struct mr_out_kv *);
+} reducer_args_t;
+
+static void *reducer_thread(void *arg) {
+    reducer_args_t *a = arg;
+    for (size_t i = a->start_idx; i < a->end_idx; ++i) {
+        a->reduce_fn(&a->groups[i]);
+    }
+    return NULL;
+}
+
+/* ---------- mr_exec (multithreaded) ---------- */
+
+int mr_exec(const struct mr_input *input,
+            void (*map)(const struct mr_in_kv *),
+            size_t mapper_count,
+            void (*reduce)(const struct mr_out_kv *),
+            size_t reducer_count,
+            struct mr_output *output)
+{
+    if (!input || !map || !reduce || !output) return -1;
+    if (mapper_count == 0) mapper_count = 1;
+    if (reducer_count == 0) reducer_count = 1;
+
+    /* initialize intermediate storage */
+    intermediate_pairs = NULL;
+    intermediate_pairs_cap = intermediate_pairs_count = 0;
+
+    final_out = NULL;
+    final_out_cap = final_out_count = 0;
+
+    /* ---------- spawn mapper threads ---------- */
+    pthread_t *mthreads = calloc(mapper_count, sizeof(pthread_t));
+    mapper_args_t *margs = calloc(mapper_count, sizeof(mapper_args_t));
+    pthread_mutex_t index_mutex = PTHREAD_MUTEX_INITIALIZER;
+    size_t next_index = 0;
+
+    for (size_t i = 0; i < mapper_count; ++i) {
+        margs[i].input_arr = input->kv_lst;
+        margs[i].input_count = input->count;
+        margs[i].next_index = &next_index;
+        margs[i].index_mutex = &index_mutex;
+        margs[i].map_fn = map;
+        if (pthread_create(&mthreads[i], NULL, mapper_thread, &margs[i]) != 0) {
+            /* fallback: join already-created threads then cleanup */
+            for (size_t j = 0; j < i; ++j) pthread_join(mthreads[j], NULL);
+            free(mthreads); free(margs);
+            return -1;
+        }
+    }
+
+    /* join mapper threads */
+    for (size_t i = 0; i < mapper_count; ++i) {
+        pthread_join(mthreads[i], NULL);
+    }
+    free(mthreads);
+    free(margs);
+
+    /* ---------- group intermediate pairs by key ---------- */
+    size_t group_count = 0;
+    struct mr_out_kv *groups = group_intermediate(&group_count);
+    if (!groups && intermediate_pairs_count > 0) {
+        /* grouping failed (memory) */
+        /* free intermediate_pairs */
+        free(intermediate_pairs);
+        intermediate_pairs = NULL;
+        return -1;
+    }
+
+    /* we can free intermediate_pairs now */
+    free(intermediate_pairs);
+    intermediate_pairs = NULL;
+
+    /* ---------- spawn reducer threads ---------- */
+    if (group_count == 0) {
+        /* no intermediate output: produce empty final output */
+        output->kv_lst = NULL;
+        output->count = 0;
+        /* cleanup groups (none) and final_out (none) */
+        return 0;
+    }
+
+    pthread_t *rthreads = calloc(reducer_count, sizeof(pthread_t));
+    reducer_args_t *rargs = calloc(reducer_count, sizeof(reducer_args_t));
+    if (!rthreads || !rargs) {
+        for (size_t i = 0; i < group_count; ++i) free(groups[i].value);
+        free(groups);
+        free(rthreads); free(rargs);
+        return -1;
+    }
+
+    /* split groups into roughly equal contiguous ranges */
+    for (size_t i = 0; i < reducer_count; ++i) {
+        size_t start = (group_count * i) / reducer_count;
+        size_t end = (group_count * (i + 1)) / reducer_count;
+        rargs[i].groups = groups;
+        rargs[i].start_idx = start;
+        rargs[i].end_idx = end;
+        rargs[i].reduce_fn = reduce;
+        if (start >= end) {
+            rthreads[i] = 0;
+            continue;
+        }
+        if (pthread_create(&rthreads[i], NULL, reducer_thread, &rargs[i]) != 0) {
+            /* on failure, join previous reducers */
+            for (size_t j = 0; j < i; ++j) if (rthreads[j]) pthread_join(rthreads[j], NULL);
+            for (size_t k = 0; k < group_count; ++k) free(groups[k].value);
+            free(groups);
+            free(rthreads); free(rargs);
+            return -1;
+        }
+    }
+
+    /* join reducers */
+    for (size_t i = 0; i < reducer_count; ++i) {
+        if (rthreads[i]) pthread_join(rthreads[i], NULL);
+    }
+    free(rthreads);
+    free(rargs);
+
+    /* ---------- prepare final output structure for caller ---------- */
+    /* final_out[] contains the emitted final keys/values from reducers */
+    if (final_out_count == 0) {
+        output->kv_lst = NULL;
+        output->count = 0;
+    } else {
+        /* allocate exact-size array and copy */
+        output->kv_lst = malloc(sizeof(struct mr_out_kv) * final_out_count);
+        if (!output->kv_lst) {
+            for (size_t k = 0; k < group_count; ++k) free(groups[k].value);
+            free(groups);
+            return -1;
+        }
+        for (size_t i = 0; i < final_out_count; ++i) {
+            output->kv_lst[i].count = final_out[i].count;
+            strncpy(output->kv_lst[i].key, final_out[i].key, MAX_KEY_SIZE);
+            /* steal pointer to value array so caller owns it */
+            output->kv_lst[i].value = final_out[i].value;
+        }
+        output->count = final_out_count;
+    }
+
+    /* cleanup group memory (groups' value arrays are independent) */
+    for (size_t k = 0; k < group_count; ++k) free(groups[k].value);
+    free(groups);
+
+    /* note: final_out array itself has been partially moved into output->kv_lst
+       and the pointers swapped; free the container but not the value pointers */
+    free(final_out);
+    final_out = NULL;
+
+    return 0;
+}
+

@@ -1,0 +1,227 @@
+#include "interface.h"
+#include "uthash.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_INTERMEDIATE 1024
+#define MAX_VALUES_PER_KEY 256
+
+// -----------------------------
+// INTERMEDIATE STORAGE
+// -----------------------------
+static struct mr_out_kv intermediate[MAX_INTERMEDIATE];
+static size_t intermediate_count = 0;
+pthread_mutex_t intermediate_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// -----------------------------
+// FINAL STORAGE (with uthash)
+// -----------------------------
+struct final_kv {
+  char key[MAX_KEY_SIZE];
+  char (*value)[MAX_VALUE_SIZE];
+  size_t count;
+  UT_hash_handle hh;
+};
+static struct final_kv *final_table = NULL;
+pthread_mutex_t final_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// -----------------------------
+// HELPER: INIT
+// -----------------------------
+static void init_intermediate() {
+  for (size_t i = 0; i < MAX_INTERMEDIATE; i++) {
+    intermediate[i].value =
+        malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    intermediate[i].count = 0;
+    intermediate[i].key[0] = '\0';
+  }
+}
+
+static void free_intermediate() {
+  for (size_t i = 0; i < intermediate_count; i++) {
+    free(intermediate[i].value);
+  }
+}
+
+static void free_final_table() {
+  struct final_kv *current, *tmp;
+  HASH_ITER(hh, final_table, current, tmp) {
+    HASH_DEL(final_table, current);
+    free(current->value);
+    free(current);
+  }
+}
+
+// -----------------------------
+// FIND OR CREATE INTERMEDIATE
+// -----------------------------
+static struct mr_out_kv *find_or_create_intermediate(const char *key) {
+  for (size_t i = 0; i < intermediate_count; i++) {
+    if (strcmp(intermediate[i].key, key) == 0)
+      return &intermediate[i];
+  }
+  if (intermediate_count >= MAX_INTERMEDIATE)
+    return NULL;
+  struct mr_out_kv *kv = &intermediate[intermediate_count++];
+  strcpy(kv->key, key);
+  kv->count = 0;
+  return kv;
+}
+
+// -----------------------------
+// EMIT FUNCTIONS
+// -----------------------------
+int mr_emit_i(const char *key, const char *value) {
+  pthread_mutex_lock(&intermediate_mutex);
+  struct mr_out_kv *kv = find_or_create_intermediate(key);
+  if (!kv) {
+    pthread_mutex_unlock(&intermediate_mutex);
+    return -1;
+  }
+  strcpy(kv->value[kv->count], value);
+  kv->count++;
+  pthread_mutex_unlock(&intermediate_mutex);
+  return 0;
+}
+
+int mr_emit_f(const char *key, const char *value) {
+  pthread_mutex_lock(&final_mutex);
+  struct final_kv *entry = NULL;
+  HASH_FIND_STR(final_table, key, entry);
+  if (!entry) {
+    entry = malloc(sizeof(struct final_kv));
+    strcpy(entry->key, key);
+    entry->count = 0;
+    entry->value = malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    HASH_ADD_STR(final_table, key, entry);
+  }
+  strcpy(entry->value[entry->count], value);
+  entry->count++;
+  pthread_mutex_unlock(&final_mutex);
+  return 0;
+}
+
+// -----------------------------
+// THREAD ARGUMENTS
+// -----------------------------
+struct map_args {
+  const struct mr_in_kv *input;
+  size_t start;
+  size_t end;
+  void (*map)(const struct mr_in_kv *);
+};
+
+struct reduce_args {
+  size_t start;
+  size_t end;
+  void (*reduce)(const struct mr_out_kv *);
+};
+
+// -----------------------------
+// THREAD FUNCTIONS
+// -----------------------------
+void *map_thread(void *arg) {
+  struct map_args *args = arg;
+  for (size_t i = args->start; i < args->end; i++) {
+    args->map(&args->input[i]);
+  }
+  return NULL;
+}
+
+void *reduce_thread(void *arg) {
+  struct reduce_args *args = arg;
+  for (size_t i = args->start; i < args->end; i++) {
+    args->reduce(&intermediate[i]);
+  }
+  return NULL;
+}
+
+int final_kv_cmp(struct final_kv *a, struct final_kv *b) {
+    return strcmp(a->key, b->key);
+}
+
+
+
+// -----------------------------
+// EXECUTE MAPREDUCE
+// -----------------------------
+int mr_exec(const struct mr_input *input, void (*map)(const struct mr_in_kv *),
+            size_t mapper_count, void (*reduce)(const struct mr_out_kv *),
+            size_t reducer_count, struct mr_output *output) {
+
+  init_intermediate();
+  intermediate_count = 0;
+
+  // -------------------------
+  // MAP PHASE
+  // -------------------------
+  pthread_t mthreads[mapper_count];
+  struct map_args margs[mapper_count];
+  size_t chunk_size = (input->count + mapper_count - 1) / mapper_count;
+
+  for (size_t t = 0; t < mapper_count; t++) {
+    margs[t].input = input->kv_lst;
+    margs[t].start = t * chunk_size;
+    margs[t].end = (t + 1) * chunk_size;
+    if (margs[t].end > input->count)
+      margs[t].end = input->count;
+    margs[t].map = map;
+    pthread_create(&mthreads[t], NULL, map_thread, &margs[t]);
+  }
+
+  for (size_t t = 0; t < mapper_count; t++)
+    pthread_join(mthreads[t], NULL);
+
+  // -------------------------
+  // REDUCE PHASE
+  // -------------------------
+  pthread_t rthreads[reducer_count];
+  struct reduce_args rargs[reducer_count];
+  size_t rchunk = (intermediate_count + reducer_count - 1) / reducer_count;
+
+  for (size_t t = 0; t < reducer_count; t++) {
+    rargs[t].start = t * rchunk;
+    rargs[t].end = (t + 1) * rchunk;
+    if (rargs[t].end > intermediate_count)
+      rargs[t].end = intermediate_count;
+    rargs[t].reduce = reduce;
+    pthread_create(&rthreads[t], NULL, reduce_thread, &rargs[t]);
+  }
+
+  for (size_t t = 0; t < reducer_count; t++)
+    pthread_join(rthreads[t], NULL);
+
+  // -------------------------
+  // WRITE FINAL OUTPUT
+  // -------------------------
+
+  // Sort the hash table by key
+HASH_SORT(final_table, final_kv_cmp);
+
+// Count entries
+size_t count = HASH_COUNT(final_table);
+output->kv_lst = malloc(sizeof(struct mr_out_kv) * count);
+output->count = 0;
+
+// Copy sorted entries to output
+struct final_kv *entry, *tmp;
+HASH_ITER(hh, final_table, entry, tmp) {
+    struct mr_out_kv *out = &output->kv_lst[output->count];
+    strcpy(out->key, entry->key);
+    out->count = entry->count;
+    out->value = malloc(sizeof(char[MAX_VALUES_PER_KEY][MAX_VALUE_SIZE]));
+    for (size_t i = 0; i < entry->count; i++) {
+        strcpy(out->value[i], entry->value[i]);
+    }
+    output->count++;
+}
+
+
+  // cleanup
+  free_intermediate();
+  free_final_table();
+
+  return 0;
+}
