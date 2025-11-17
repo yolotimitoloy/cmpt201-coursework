@@ -1,0 +1,36 @@
+// this is the server code
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+int main() {
+  printf("SERVER:\n");
+
+  // socket
+  int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (socket_fd == -1) {
+    perror("socket failed!");
+    exit(EXIT_FAILURE);
+  }
+  // bind
+  struct sockaddr_un sockstruct;
+  sockstruct.sun_family = AF_UNIX;
+  snprintf(sockstruct.sun_path, 108, "socket_fun");
+
+  if (connect(socket_fd, (struct sockaddr *)&sockstruct,
+              sizeof(struct sockaddr_un)) == -1) {
+    perror("connect failed!");
+    exit(EXIT_FAILURE);
+  }
+
+  // write
+  char *msg = "hello world!\n";
+  write(socket_fd, msg, strlen(msg));
+
+  // close
+  close(socket_fd);
+
+  return 0;
+}

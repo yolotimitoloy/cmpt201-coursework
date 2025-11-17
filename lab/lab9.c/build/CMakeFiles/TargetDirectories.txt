@@ -1,0 +1,4 @@
+/home/cmpt201/cmpt201-coursework/lab/lab9.c/build/CMakeFiles/server.dir
+/home/cmpt201/cmpt201-coursework/lab/lab9.c/build/CMakeFiles/client.dir
+/home/cmpt201/cmpt201-coursework/lab/lab9.c/build/CMakeFiles/edit_cache.dir
+/home/cmpt201/cmpt201-coursework/lab/lab9.c/build/CMakeFiles/rebuild_cache.dir

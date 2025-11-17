@@ -1,0 +1,1 @@
+/usr/bin/clang CMakeFiles/server.dir/server.c.o -o server 
