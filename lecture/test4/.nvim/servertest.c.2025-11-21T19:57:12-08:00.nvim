@@ -1,0 +1,230 @@
+#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
+
+// --- Global Variables ---
+volatile int server_running = 1;
+pthread_mutex_t running_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// --- Utility Functions ---
+
+/**
+ * @brief Handles communication with an individual client.
+ * @param socket_desc_ptr A pointer to the client socket file descriptor.
+ * @return void* Always NULL upon thread exit.
+ */
+void *client_handler(void *socket_desc_ptr) {
+    int client_socket = *(int *)socket_desc_ptr;
+    free(socket_desc_ptr); // Free the memory allocated in the main thread
+    
+    char buffer[1024] = {0};
+    ssize_t valread;
+    
+    printf("[Client %d] Handler thread started.\n", client_socket);
+
+    // Read the client message
+    if ((valread = read(client_socket, buffer, 1024)) > 0) {
+        // Null-terminate the string
+        buffer[valread] = '\0';
+        printf("[Client %d] Received: %s\n", client_socket, buffer);
+
+        // Simple response
+        const char *message = "Hello from the server! Message received.";
+        send(client_socket, message, strlen(message), 0);
+        printf("[Client %d] Response sent.\n", client_socket);
+    } else if (valread == 0) {
+        printf("[Client %d] Client disconnected gracefully.\n", client_socket);
+    } else {
+        // Check if the read failure was due to a non-blocking configuration (unlikely here)
+        // or a genuine error.
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("[Client Handler] read failed");
+        }
+    }
+
+    // Close the socket and exit the thread
+    close(client_socket);
+    printf("[Client %d] Handler thread finished.\n", client_socket);
+    return NULL;
+}
+
+/**
+ * @brief Thread dedicated to receiving the "shutdown" command from stdin.
+ * @param arg Unused argument.
+ * @return void* Always NULL upon thread exit.
+ */
+void *server_control_thread(void *arg) {
+    char input_buffer[64];
+    
+    printf("\n--- Server Control Thread Activated ---\n");
+    printf("Enter 'shutdown' to stop the server gracefully.\n");
+
+    // Loop until the shutdown command is received
+    while (1) {
+        if (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
+            // Remove newline character
+            input_buffer[strcspn(input_buffer, "\n")] = 0; 
+            
+            if (strcmp(input_buffer, "shutdown") == 0) {
+                printf("\n[Control] Shutdown command received. Initiating graceful stop...\n");
+                
+                // Set the global running flag to 0 safely
+                pthread_mutex_lock(&running_mutex);
+                server_running = 0;
+                pthread_mutex_unlock(&running_mutex);
+                break; // Exit the control loop
+            } else {
+                printf("[Control] Unknown command: %s. Type 'shutdown'.\n", input_buffer);
+            }
+        } else {
+            // Handle EOF/error on stdin
+            break;
+        }
+    }
+    return NULL;
+}
+
+
+// --- Main Program ---
+int main(int argc, char *argv[]) {
+    int server_fd;
+    socklen_t addrlen = sizeof(struct sockaddr_in);
+    struct sockaddr_in address;
+    int port;
+    int max_clients;
+
+    // 1. Argument Validation
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <port> <max_pending_clients>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    port = atoi(argv[1]);
+    max_clients = atoi(argv[2]);
+
+    if (port <= 0 || port > 65535 || max_clients <= 0) {
+        fprintf(stderr, "Invalid port or max_pending_clients value.\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("Attempting to start server on Port: %d with Max Clients: %d\n", port, max_clients);
+
+
+    // 2. Create socket file descriptor
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set socket options to reuse address and port (helpful for debugging)
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt failed");
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port); // Use the command-line argument for port
+
+    // 3. Bind the socket
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // 4. Start listening for connections
+    if (listen(server_fd, max_clients) < 0) { // Use the command-line argument for max_clients
+        perror("Listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // 5. Set the listening socket to NON-BLOCKING mode
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("F_GETFL failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("F_SETFL O_NONBLOCK failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+    printf("Listening socket set to non-blocking mode.\n");
+    
+    // Create the control thread
+    pthread_t control_tid;
+    if (pthread_create(&control_tid, NULL, server_control_thread, NULL) != 0) {
+        perror("Failed to create control thread");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server listening on port %d...\n", port);
+
+    // Main server loop
+    while (server_running) {
+        int new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+
+        if (new_socket > 0) {
+            // Success: A client connected
+            printf("[Main] New connection accepted on socket %d\n", new_socket);
+
+            // Allocate memory for the socket descriptor to pass to the thread
+            int *new_sock = (int *)malloc(sizeof(int));
+            if (new_sock == NULL) {
+                perror("[Main] Failed to allocate memory for client socket");
+                close(new_socket);
+                continue; 
+            }
+            *new_sock = new_socket;
+
+            // Create a new thread for the client
+            pthread_t client_tid;
+            if (pthread_create(&client_tid, NULL, client_handler, (void *)new_sock) < 0) {
+                perror("[Main] Could not create client thread");
+                free(new_sock); // Free memory on failure
+                close(new_socket);
+            }
+            // Detach the thread so its resources are automatically cleaned up
+            pthread_detach(client_tid);
+            
+        } else if (new_socket < 0) {
+            // Check for non-blocking errors (EAGAIN/EWOULDBLOCK)
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No incoming connections. Sleep briefly to avoid busy-waiting.
+                usleep(100000); // 100ms
+            } else {
+                // A real error occurred
+                if (server_running) {
+                    perror("[Main] Accept failed unexpectedly");
+                }
+                break; // Exit the loop on critical error
+            }
+        }
+    }
+
+    // --- Graceful Shutdown Sequence ---
+    printf("\n[Main] Exiting main loop. Shutting down server...\n");
+
+    // Close the listening socket
+    close(server_fd);
+    printf("[Main] Listener socket closed.\n");
+
+    // Wait for the control thread to finish
+    pthread_join(control_tid, NULL);
+    printf("[Main] Control thread joined.\n");
+    
+    printf("Server shutdown complete. Goodbye!\n");
+    return 0;
+}

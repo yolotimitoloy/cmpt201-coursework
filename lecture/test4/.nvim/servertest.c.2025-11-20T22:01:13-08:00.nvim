@@ -1,0 +1,458 @@
+/* server_no_select.c
+   Usage: ./server <port> <#expected_clients>
+   Builds with: gcc -pthread server_no_select.c -o server
+*/
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define MAX_MSG_SIZE 1024
+#define MAX_CLIENTS 100
+#define TYPE_REGULAR 0
+#define TYPE_END_EXECUTION 1
+
+/* --- Broadcast queue node --- */
+typedef struct message_node {
+  char buffer[MAX_MSG_SIZE];
+  size_t len;
+  struct message_node *next;
+} message_node_t;
+
+/* --- Client structure (heap allocated per connection) --- */
+typedef struct client {
+  int fd;
+  struct sockaddr_in addr;
+  socklen_t addr_len;
+  pthread_t tid;
+  atomic_bool active; /* true while thread should run */
+  char inbuf[MAX_MSG_SIZE];
+  size_t inbuf_len;
+} client_t;
+
+/* Globals protected by client_list_lock */
+static client_t *clients[MAX_CLIENTS];
+static int num_clients = 0;
+static int expected_clients = 0;
+static int finished_clients_count = 0; /* protected by client_list_lock */
+
+static pthread_mutex_t client_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Broadcast queue globals */
+static message_node_t *queue_head = NULL;
+static message_node_t *queue_tail = NULL;
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+/* Server running flag */
+static atomic_bool server_running = ATOMIC_VAR_INIT(true);
+
+/* Forward declarations */
+void enqueue_message(const char *buffer, size_t len);
+message_node_t *dequeue_message(void);
+void *broadcast_worker(void *arg);
+void *client_thread_fn(void *arg);
+ssize_t write_all(int fd, const void *buf, size_t count);
+int handle_message(client_t *cl, char *buffer, ssize_t len);
+
+void perror_exit(const char *msg) {
+  perror(msg);
+  exit(EXIT_FAILURE);
+}
+
+/* Enqueue a message for broadcasting (thread-safe) */
+void enqueue_message(const char *buffer, size_t len) {
+  message_node_t *node = malloc(sizeof(message_node_t));
+  if (!node) {
+    perror("enqueue_message: malloc");
+    return;
+  }
+  if (len > MAX_MSG_SIZE) len = MAX_MSG_SIZE;
+  memcpy(node->buffer, buffer, len);
+  node->len = len;
+  node->next = NULL;
+
+  pthread_mutex_lock(&queue_lock);
+  if (queue_tail == NULL) {
+    queue_head = queue_tail = node;
+  } else {
+    queue_tail->next = node;
+    queue_tail = node;
+  }
+  pthread_cond_signal(&queue_cond);
+  pthread_mutex_unlock(&queue_lock);
+}
+
+/* Dequeue a message. Returns NULL if server shutting down and queue empty. */
+message_node_t *dequeue_message(void) {
+  pthread_mutex_lock(&queue_lock);
+  while (queue_head == NULL && atomic_load(&server_running)) {
+    pthread_cond_wait(&queue_cond, &queue_lock);
+  }
+
+  if (queue_head == NULL) {
+    pthread_mutex_unlock(&queue_lock);
+    return NULL;
+  }
+
+  message_node_t *node = queue_head;
+  queue_head = queue_head->next;
+  if (queue_head == NULL) queue_tail = NULL;
+  pthread_mutex_unlock(&queue_lock);
+  return node;
+}
+
+/* Reliable write helper that handles short writes & EINTR */
+ssize_t write_all(int fd, const void *buf, size_t count) {
+  const char *p = buf;
+  size_t left = count;
+  while (left > 0) {
+    ssize_t w = write(fd, p, left);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    left -= (size_t)w;
+    p += w;
+  }
+  return (ssize_t)count;
+}
+
+/* Broadcast worker thread: dequeues and writes to all current clients.
+   It keeps writing until server_running is false and queue is empty. */
+void *broadcast_worker(void *arg) {
+  (void)arg;
+  while (true) {
+    message_node_t *node = dequeue_message();
+    if (!node) {
+      /* queue empty and server not running -> exit */
+      break;
+    }
+
+    /* Copy the client list snapshot under lock, then write without holding lock
+       to avoid blocking other operations for too long. We will still need to
+       handle write errors (close fd) in a conservative way: close and rely on
+       client thread to cleanup. */
+    pthread_mutex_lock(&client_list_lock);
+    int snapshot_n = num_clients;
+    client_t *snapshot[MAX_CLIENTS];
+    for (int i = 0; i < snapshot_n; ++i) snapshot[i] = clients[i];
+    pthread_mutex_unlock(&client_list_lock);
+
+    for (int i = 0; i < snapshot_n; ++i) {
+      client_t *c = snapshot[i];
+      if (!c) continue;
+      if (!atomic_load(&c->active)) continue;
+
+      if (write_all(c->fd, node->buffer, node->len) == -1) {
+        /* If write fails, close socket so the client thread will detect and cleanup */
+        perror("broadcast_worker: write_all");
+        /* attempt best-effort close; client thread will handle removal */
+        close(c->fd);
+        atomic_store(&c->active, false);
+      }
+    }
+
+    free(node);
+  }
+
+  return NULL;
+}
+
+/* Find and remove client pointer from global array.
+   Assumes client_list_lock is held by caller. Does NOT free client struct.
+   Caller should free() after unlocking if desired. */
+static void remove_client_from_list_locked(client_t *c) {
+  for (int i = 0; i < num_clients; ++i) {
+    if (clients[i] == c) {
+      /* replace with last and shrink */
+      clients[i] = clients[num_clients - 1];
+      clients[num_clients - 1] = NULL;
+      num_clients--;
+      return;
+    }
+  }
+}
+
+/* Thread function for each client */
+void *client_thread_fn(void *arg) {
+  client_t *c = (client_t *)arg;
+  char localbuf[MAX_MSG_SIZE];
+  ssize_t total_len = 0;
+
+  while (atomic_load(&server_running) && atomic_load(&c->active)) {
+    ssize_t bytes = read(c->fd, localbuf + total_len, MAX_MSG_SIZE - total_len);
+    if (bytes < 0) {
+      if (errno == EINTR) continue;
+      perror("client read");
+      break;
+    } else if (bytes == 0) {
+      /* peer closed */
+      break;
+    }
+
+    total_len += bytes;
+
+    /* process all complete messages in the buffer */
+    int res;
+    while ((res = handle_message(c, localbuf, total_len)) > 0) {
+      /* res is number of bytes consumed */
+      if ((size_t)res < (size_t)total_len) {
+        memmove(localbuf, localbuf + res, total_len - res);
+      }
+      total_len -= res;
+    }
+
+    if (res == -2) { /* shutdown requested */
+      /* server will be shutting down */
+      break;
+    } else if (res == -1) {
+      /* message handling error; treat as disconnect */
+      break;
+    }
+  }
+
+  /* Begin cleanup for this client */
+  atomic_store(&c->active, false);
+  close(c->fd);
+
+  /* remove from global list */
+  pthread_mutex_lock(&client_list_lock);
+  remove_client_from_list_locked(c);
+
+  /* If this client's Type-1 was not already counted but it sent it, we assume
+     handle_message did the counting. Nothing to do here. */
+  pthread_mutex_unlock(&client_list_lock);
+
+  free(c);
+  return NULL;
+}
+
+/* Build broadcast payloads and handle Type-1 logic.
+   Returns:
+     >0 bytes consumed from buffer
+      0 incomplete
+     -1 error / should disconnect
+     -2 shutdown triggered (main thread should exit)
+*/
+int handle_message(client_t *cl, char *buffer, ssize_t len) {
+  if (len <= 0) return -1;
+
+  /* find newline */
+  char *nl = memchr(buffer, '\n', (size_t)len);
+  if (!nl) return 0; /* incomplete */
+
+  size_t msg_len = (nl - buffer) + 1; /* include newline */
+  uint8_t type = (uint8_t)buffer[0];
+
+  if (type == TYPE_REGULAR) {
+    /* Type 0: regular; build broadcast: [type(1)] [ip(4)] [port(2)] [payload (msg_len-1)] */
+    char out[MAX_MSG_SIZE];
+    if (msg_len + 6 > MAX_MSG_SIZE) {
+      fprintf(stderr, "dropping oversized message from client fd %d\n", cl->fd);
+    } else {
+      out[0] = TYPE_REGULAR;
+      uint32_t ip_nbo = cl->addr.sin_addr.s_addr;
+      uint16_t port_nbo = cl->addr.sin_port;
+      memcpy(out + 1, &ip_nbo, sizeof(ip_nbo));
+      memcpy(out + 1 + sizeof(ip_nbo), &port_nbo, sizeof(port_nbo));
+      memcpy(out + 7, buffer + 1, msg_len - 1); /* client's payload (excluding first type byte) */
+      size_t outlen = msg_len + 6;
+      enqueue_message(out, outlen);
+    }
+  } else if (type == TYPE_END_EXECUTION) {
+    /* Type 1: client signals it finished phase1 */
+    /* Only honor Type-1 if we've already accepted expected_clients connections.
+       This prevents early shutdown when an early client accidentally sends a 1. */
+    pthread_mutex_lock(&client_list_lock);
+    if (num_clients < expected_clients) {
+      /* ignore for now (but consume the message) */
+      printf("Ignored Type-1 from fd %d until all clients connected (%d/%d)\n",
+             cl->fd, num_clients, expected_clients);
+      pthread_mutex_unlock(&client_list_lock);
+    } else {
+      finished_clients_count++;
+      printf("T1 received from fd %d. finished count: %d/%d\n",
+             cl->fd, finished_clients_count, expected_clients);
+
+      if (finished_clients_count == expected_clients) {
+        /* Phase 2 commit: broadcast Type-1 to all clients and initiate shutdown */
+        char commit[2] = {TYPE_END_EXECUTION, '\n'};
+        enqueue_message(commit, sizeof(commit));
+
+        /* initiate shutdown after enqueuing commit */
+        atomic_store(&server_running, false);
+
+        /* wake broadcast worker if it's waiting */
+        pthread_mutex_lock(&queue_lock);
+        pthread_cond_signal(&queue_cond);
+        pthread_mutex_unlock(&queue_lock);
+
+        pthread_mutex_unlock(&client_list_lock);
+        return -2; /* tell caller to stop (shutdown) */
+      }
+      pthread_mutex_unlock(&client_list_lock);
+    }
+  } else {
+    fprintf(stderr, "Unknown message type %u from fd %d\n", type, cl->fd);
+  }
+
+  return (int)msg_len;
+}
+
+/* Cleanup helper used on fatal errors or normal shutdown */
+void cleanup_and_exit(int listen_fd, pthread_t worker_tid) {
+  printf("Server cleanup starting...\n");
+
+  /* stop accepting */
+  atomic_store(&server_running, false);
+
+  /* wake worker */
+  pthread_mutex_lock(&queue_lock);
+  pthread_cond_signal(&queue_cond);
+  pthread_mutex_unlock(&queue_lock);
+
+  /* wait for broadcast worker */
+  if (worker_tid) pthread_join(worker_tid, NULL);
+
+  /* close listener */
+  if (listen_fd != -1) close(listen_fd);
+
+  /* close and free all clients */
+  pthread_mutex_lock(&client_list_lock);
+  for (int i = 0; i < num_clients; ++i) {
+    client_t *c = clients[i];
+    if (c) {
+      atomic_store(&c->active, false);
+      close(c->fd);
+      /* we can't free here if the client thread is still running; we will free
+         when client thread exits. But to be safe, try to join thread briefly. */
+    }
+  }
+  pthread_mutex_unlock(&client_list_lock);
+
+  /* Give threads a little time? Not needed; just exit. */
+  printf("Exiting now.\n");
+  exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char *argv[]) {
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <port> <#expected_clients>\n", argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  int port = atoi(argv[1]);
+  expected_clients = atoi(argv[2]);
+  if (expected_clients <= 0 || expected_clients > MAX_CLIENTS) {
+    fprintf(stderr, "expected_clients must be 1..%d\n", MAX_CLIENTS);
+    return EXIT_FAILURE;
+  }
+
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0) perror_exit("socket");
+
+  int opt = 1;
+  if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    perror("setsockopt SO_REUSEADDR");
+  }
+
+  struct sockaddr_in serv_addr;
+  memset(&serv_addr, 0, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_addr.s_addr = INADDR_ANY;
+  serv_addr.sin_port = htons((uint16_t)port);
+
+  if (bind(listen_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+    perror_exit("bind");
+
+  /* backlog: allow up to expected_clients (or SOMAXCONN if available) */
+  if (listen(listen_fd, expected_clients) < 0) perror_exit("listen");
+
+  printf("Listening on port %d; expecting %d clients\n", port, expected_clients);
+
+  /* start broadcast worker */
+  pthread_t worker_tid = 0;
+  if (pthread_create(&worker_tid, NULL, broadcast_worker, NULL) != 0) {
+    perror_exit("pthread_create broadcast_worker");
+  }
+
+  /* Accept loop: accept until we've reached expected_clients. After that,
+     we continue accepting until server_running becomes false (if you want to
+     stop accepting once expected reached, you can break here). */
+  while (atomic_load(&server_running)) {
+    if (num_clients >= expected_clients) {
+      /* We will still allow existing clients to run. If you prefer to stop
+         accepting new connections after expected_clients, uncomment break. */
+      /* break; */
+    }
+
+    struct sockaddr_in cli_addr;
+    socklen_t cli_len = sizeof(cli_addr);
+    int new_fd = accept(listen_fd, (struct sockaddr *)&cli_addr, &cli_len);
+    if (new_fd < 0) {
+      if (errno == EINTR) continue;
+      perror("accept");
+      break;
+    }
+
+    /* configure socket options: optional (e.g. disable sigpipe) */
+#ifdef SO_NOSIGPIPE
+    int val = 1;
+    setsockopt(new_fd, SOL_SOCKET, SO_NOSIGPIPE, &val, sizeof(val));
+#endif
+
+    /* allocate and initialize client struct */
+    client_t *c = malloc(sizeof(client_t));
+    if (!c) {
+      perror("malloc client");
+      close(new_fd);
+      continue;
+    }
+    c->fd = new_fd;
+    c->addr = cli_addr;
+    c->addr_len = cli_len;
+    atomic_store(&c->active, true);
+    c->inbuf_len = 0;
+    memset(c->inbuf, 0, sizeof(c->inbuf));
+
+    /* add to client list */
+    pthread_mutex_lock(&client_list_lock);
+    if (num_clients < MAX_CLIENTS) {
+      clients[num_clients++] = c;
+      printf("Accepted %s:%d (fd %d) — clients: %d/%d\n",
+             inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port), c->fd,
+             num_clients, expected_clients);
+
+      /* spawn thread for this client */
+      if (pthread_create(&c->tid, NULL, client_thread_fn, c) != 0) {
+        perror("pthread_create client");
+        /* cleanup */
+        atomic_store(&c->active, false);
+        close(c->fd);
+        free(c);
+        /* remove pointer we just added */
+        num_clients--;
+      }
+    } else {
+      /* too many; refuse */
+      fprintf(stderr, "Rejecting connection (max clients reached)\n");
+      close(new_fd);
+      free(c);
+    }
+    pthread_mutex_unlock(&client_list_lock);
+  }
+
+  /* server_running is false here -> cleanup and join worker */
+  cleanup_and_exit(listen_fd, worker_tid);
+  return 0;
+}
+

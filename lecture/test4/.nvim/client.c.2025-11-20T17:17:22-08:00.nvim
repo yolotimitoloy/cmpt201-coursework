@@ -1,0 +1,295 @@
+#define _GNU_SOURCE /* See feature_test_macros(7) */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define MAX_MSG_SIZE 1024
+#define TYPE_REGULAR 0
+#define TYPE_END_EXECUTION 1
+#define RANDOM_BYTES_LEN 10 // Example size for random payload
+
+// Global state
+int sock_fd;
+char *log_file_path;
+int num_messages_to_send;
+volatile int keep_running = 1;
+
+// --- Utility Functions ---
+
+void error(const char *msg) {
+  perror(msg);
+  exit(EXIT_FAILURE);
+}
+
+/* * The conversion utility function provided in the prompt.
+ */
+int convert(uint8_t *buf, ssize_t buf_size, char *str, ssize_t str_size) {
+  if (buf == NULL || str == NULL || buf_size <= 0 ||
+      str_size < (buf_size * 2 + 1)) {
+    return -1;
+  }
+
+  for (int i = 0; i < buf_size; i++)
+    sprintf(str + i * 2, "%02X", buf[i]);
+  str[buf_size * 2] = '\0';
+
+  return 0;
+}
+
+// --- Client Sender Thread ---
+
+void *sender_thread(void *arg) {
+  (void)arg; // Unused
+
+  uint8_t rand_buf[RANDOM_BYTES_LEN];
+  char hex_str[RANDOM_BYTES_LEN * 2 + 1];
+
+  for (int i = 0; i < num_messages_to_send && keep_running; i++) {
+    // 1. Generate random message payload
+    if (getentropy(rand_buf, sizeof(rand_buf)) == -1) {
+      perror("getentropy failed");
+      break;
+    }
+
+    if (convert(rand_buf, sizeof(rand_buf), hex_str, sizeof(hex_str)) != 0) {
+      fprintf(stderr, "Conversion error.\n");
+      break;
+    }
+
+    // 2. Construct Type 0 message: [Type 0 | Hex String | '\n']
+    char send_buffer[MAX_MSG_SIZE];
+    size_t payload_len = strlen(hex_str);
+
+    if (1 + payload_len + 1 > MAX_MSG_SIZE) {
+      fprintf(stderr, "Generated message is too long.\n");
+      continue;
+    }
+
+    send_buffer[0] = TYPE_REGULAR;
+    memcpy(send_buffer + 1, hex_str, payload_len);
+    send_buffer[1 + payload_len] = '\n';
+    size_t total_len = 1 + payload_len + 1;
+
+    // 3. Send message using write()
+    if (write(sock_fd, send_buffer, total_len) == -1) {
+      perror("Sender: Error writing message");
+      break;
+    }
+
+    // Optional: short delay
+    usleep(10000);
+  }
+
+  // --- Two-Phase Commit: Phase 1 (Prepare) ---
+  if (keep_running) {
+    char commit_msg[] = {TYPE_END_EXECUTION, '\n'};
+    // Send signal using write()
+    if (write(sock_fd, commit_msg, sizeof(commit_msg)) == -1) {
+      perror("Sender: Error writing Phase 1 signal");
+    } else {
+      usleep(10000); // ADDED DELAY
+    }
+  }
+
+  return NULL;
+}
+
+// --- Client Receiver Thread ---
+
+void *receiver_thread(void *arg) {
+  (void)arg; // Unused
+
+  FILE *log_file = fopen(log_file_path, "w");
+  if (!log_file) {
+    error("Receiver: Failed to open log file");
+  }
+
+  char
+      recv_buffer[MAX_MSG_SIZE * 2]; // Buffer to handle partial reads/overflows
+  ssize_t data_len = 0;
+
+  while (keep_running) {
+    // Read using read()
+    ssize_t bytes_read =
+        read(sock_fd, recv_buffer + data_len, MAX_MSG_SIZE - data_len);
+
+    if (bytes_read <= 0) {
+      if (bytes_read == 0) {
+        printf("Receiver: Server closed connection.\n");
+      } else {
+        if (errno != EINTR) {
+          perror("Receiver: read error");
+        }
+      }
+      break;
+    }
+
+    data_len += bytes_read;
+    char *ptr = recv_buffer;
+
+    // Process all complete messages received in the buffer
+    while (data_len >= 1) {
+      uint8_t type = (uint8_t)ptr[0];
+      size_t msg_len = 0;
+
+      if (type == TYPE_REGULAR) {
+        // --- Type 0: Broadcast Group Chat Message ---
+        // Format: [Type 0 (1B) | IP (4B) | Port (2B) | Data... | '\n']
+
+        if (data_len < 7)
+          break; // Need header
+
+        char *newline_pos = memchr(ptr + 7, '\n', data_len - 7);
+        if (!newline_pos)
+          break; // Incomplete message
+
+        msg_len = newline_pos - ptr + 1;
+
+        // Extract IP and Port (Network Byte Order)
+        uint32_t ip_nbo;
+        uint16_t port_nbo;
+
+        memcpy(&ip_nbo, ptr + 1, sizeof(ip_nbo));
+        memcpy(&port_nbo, ptr + 5, sizeof(port_nbo));
+
+        // Conversion to Host Byte Order and Presentation format
+        uint32_t ip_hbo = (ip_nbo);
+        uint16_t port_hbo = ntohs(port_nbo);
+
+        struct in_addr ip_addr;
+        ip_addr.s_addr = ip_hbo;
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &ip_addr, ip_str, INET_ADDRSTRLEN);
+
+        // Extract group chat data
+        char *data_start = ptr + 7;
+        size_t data_len_only = msg_len - 7 - 1;
+
+        char chat_data[MAX_MSG_SIZE];
+        if (data_len_only >= MAX_MSG_SIZE)
+          data_len_only = MAX_MSG_SIZE - 1;
+        memcpy(chat_data, data_start, data_len_only);
+        chat_data[data_len_only] = '\0';
+
+        // Log and print
+        printf("%-15s%-10u%s\n", ip_str, port_hbo, chat_data);
+        fprintf(log_file, "%-15s%-10u%s\n", ip_str, port_hbo, chat_data);
+        fflush(log_file);
+
+      } else if (type == TYPE_END_EXECUTION) {
+        // --- Type 1: Termination Commit (Phase 2) ---
+        if (data_len < 2 || ptr[1] != '\n') {
+          break;
+        }
+        msg_len = 2; // [Type 1 | '\n']
+
+        //        printf("Receiver: Received Phase 2 commit. Shutting down.\n");
+        keep_running = 0;
+        break;
+
+      } else {
+        fprintf(stderr,
+                "Receiver: Unknown message type received: %u. Attempting to "
+                "discard.\n",
+                type);
+        char *newline_pos = memchr(ptr + 1, '\n', data_len - 1);
+        if (newline_pos) {
+          msg_len = newline_pos - ptr + 1;
+        } else {
+          break;
+        }
+      }
+
+      // Consume message and shift remaining data
+      ptr += msg_len;
+      data_len -= msg_len;
+    }
+
+    // Move partial data to the start of the buffer
+    if (data_len > 0) {
+      memmove(recv_buffer, ptr, data_len);
+    }
+  }
+
+  fclose(log_file);
+  return NULL;
+}
+
+// --- Main Client Function ---
+
+int main(int argc, char *argv[]) {
+  struct sockaddr_in serv_addr;
+  pthread_t sender_tid, receiver_tid;
+
+  if (argc < 5) {
+    fprintf(stderr,
+            "Usage: %s <IP address> <port number> <# of messages> <log file "
+            "path>\n",
+            argv[0]);
+    exit(EXIT_FAILURE);
+  }
+
+  char *ip_address = argv[1];
+  int port = atoi(argv[2]);
+  num_messages_to_send = atoi(argv[3]);
+  log_file_path = argv[4];
+
+  // 1. Create socket
+  sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock_fd < 0) {
+    error("ERROR opening socket");
+  }
+
+  // 2. Initialize server address
+  memset(&serv_addr, 0, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(port);
+
+  if (inet_pton(AF_INET, ip_address, &serv_addr.sin_addr) <= 0) {
+    fprintf(stderr, "Invalid IP address: %s\n", ip_address);
+    close(sock_fd);
+    exit(EXIT_FAILURE);
+  }
+
+  // 3. Connect to server
+  printf("Connecting to %s:%d...\n", ip_address, port);
+  if (connect(sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    error("ERROR connecting to server");
+  }
+  printf("Connected. Starting sender/receiver threads.\n");
+
+  // 4. Create sender and receiver threads
+  if (pthread_create(&sender_tid, NULL, sender_thread, NULL) != 0) {
+    error("ERROR creating sender thread");
+  }
+
+  if (pthread_create(&receiver_tid, NULL, receiver_thread, NULL) != 0) {
+    error("ERROR creating receiver thread");
+  }
+
+  // 5. Wait for threads to complete (graceful shutdown)
+  // Wait for the receiver thread, as it will break when Phase 2 is complete.
+  pthread_join(receiver_tid, NULL);
+
+  // Check if sender thread finished naturally or needs cancellation
+  int *sender_exit_code = NULL;
+  if (pthread_tryjoin_np(sender_tid, (void **)&sender_exit_code) != 0) {
+    // If the receiver thread finished, the sender must stop.
+    pthread_cancel(sender_tid);
+    pthread_join(sender_tid, NULL);
+  }
+
+  // 6. Close socket and exit
+  close(sock_fd);
+  printf("Client finished and exited.\n");
+
+  return 0;
+}

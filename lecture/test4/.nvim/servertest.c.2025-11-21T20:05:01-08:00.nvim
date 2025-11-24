@@ -1,0 +1,347 @@
+#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
+
+// --- Global Variables and Synchronization ---
+#define BUFFER_SIZE 1024
+#define BROADCAST_BUFFER_SIZE 2048
+
+// Client list will be dynamically allocated in main()
+int *client_sockets = NULL; 
+int client_count = 0;
+int max_concurrent_clients = 0; // Set via command-line argument
+
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+volatile int server_running = 1;
+
+
+// --- Client List Management Functions ---
+
+/**
+ * @brief Adds a new socket descriptor to the global client list.
+ * @param sock The client socket descriptor.
+ */
+void add_client(int sock) {
+    pthread_mutex_lock(&clients_mutex);
+    
+    // Use the dynamic max_concurrent_clients for bounds checking
+    if (client_count < max_concurrent_clients) {
+        client_sockets[client_count++] = sock;
+        printf("[List] Client %d added. Total: %d/%d\n", sock, client_count, max_concurrent_clients);
+    } else {
+        fprintf(stderr, "[List] WARNING: Max clients reached (%d). Could not add client %d.\n", max_concurrent_clients, sock);
+    }
+    
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+/**
+ * @brief Removes a socket descriptor from the global client list.
+ * @param sock The client socket descriptor to remove.
+ */
+void remove_client(int sock) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < client_count; i++) {
+        if (client_sockets[i] == sock) {
+            // Shift remaining elements to fill the gap
+            for (int j = i; j < client_count - 1; j++) {
+                client_sockets[j] = client_sockets[j + 1];
+            }
+            client_count--;
+            printf("[List] Client %d removed. Total: %d/%d\n", sock, client_count, max_concurrent_clients);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+/**
+ * @brief Sends a message to all connected clients except the sender.
+ * @param sender_sock The socket descriptor of the client who sent the message (or -1 for server announcements).
+ * @param message The null-terminated string message to broadcast.
+ */
+void broadcast_message(int sender_sock, const char *message) {
+    pthread_mutex_lock(&clients_mutex);
+    
+    for (int i = 0; i < client_count; i++) {
+        int target_sock = client_sockets[i];
+        
+        // Don't send the message back to the sender unless sender_sock is -1 (server announcement)
+        if (target_sock != sender_sock) {
+            if (send(target_sock, message, strlen(message), 0) < 0) {
+                // Non-fatal error, print warning but continue broadcasting
+                perror("broadcast_message: send failed to one client");
+                // In a robust system, you'd handle client disconnections here.
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+
+// --- Thread Functions ---
+
+/**
+ * @brief Handles communication with an individual client, reading messages and broadcasting them.
+ * @param socket_desc_ptr A pointer to the client socket file descriptor.
+ * @return void* Always NULL upon thread exit.
+ */
+void *client_handler(void *socket_desc_ptr) {
+    int client_socket = *(int *)socket_desc_ptr;
+    free(socket_desc_ptr); // Free the memory allocated in the main thread
+    
+    char client_msg[BUFFER_SIZE];
+    char broadcast_msg[BROADCAST_BUFFER_SIZE];
+    ssize_t valread;
+    
+    // 1. Add client to the global list
+    add_client(client_socket);
+    
+    // 2. Announce the arrival
+    snprintf(broadcast_msg, BROADCAST_BUFFER_SIZE, "[Server Announcement] Client %d has joined the chat.\n", client_socket);
+    broadcast_message(-1, broadcast_msg); 
+
+    printf("[Client %d] Handler thread started. Ready for chat messages.\n", client_socket);
+
+    // 3. Main communication loop
+    while (server_running) {
+        // Clear the buffer
+        memset(client_msg, 0, BUFFER_SIZE);
+        
+        // Read the client message (Blocking read)
+        valread = read(client_socket, client_msg, BUFFER_SIZE - 1);
+
+        if (valread > 0) {
+            // Null-terminate the string
+            client_msg[valread] = '\0';
+            printf("[Client %d] Received: %s\n", client_socket, client_msg);
+
+            // Format message for broadcast: Prepend client ID
+            snprintf(broadcast_msg, BROADCAST_BUFFER_SIZE, "[Client %d]: %s", client_socket, client_msg);
+            
+            // Broadcast the message to all other connected clients
+            broadcast_message(client_socket, broadcast_msg);
+            
+        } else if (valread == 0) {
+            // Client disconnected gracefully
+            printf("[Client %d] Client disconnected gracefully.\n", client_socket);
+            break; 
+        } else {
+            // Error occurred
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("[Client Handler] read failed, disconnecting client");
+                break;
+            }
+        }
+    }
+
+    // 4. Cleanup: Remove from list, announce departure, and close socket
+    
+    // Announce departure
+    snprintf(broadcast_msg, BROADCAST_BUFFER_SIZE, "[Server Announcement] Client %d has left the chat.\n", client_socket);
+    broadcast_message(-1, broadcast_msg);
+    
+    // Remove the socket from the global list
+    remove_client(client_socket);
+    
+    // Close the socket
+    close(client_socket);
+    printf("[Client %d] Handler thread finished.\n", client_socket);
+    return NULL;
+}
+
+
+/**
+ * @brief Thread dedicated to receiving the "shutdown" command from stdin.
+ * @param arg Unused argument.
+ * @return void* Always NULL upon thread exit.
+ */
+void *server_control_thread(void *arg) {
+    char input_buffer[64];
+    
+    printf("\n--- Server Control Thread Activated ---\n");
+    printf("Enter 'shutdown' to stop the server gracefully.\n");
+
+    while (1) {
+        if (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
+            input_buffer[strcspn(input_buffer, "\n")] = 0; 
+            
+            if (strcmp(input_buffer, "shutdown") == 0) {
+                printf("\n[Control] Shutdown command received. Initiating graceful stop...\n");
+                
+                // Set the global running flag to 0 safely
+                pthread_mutex_lock(&clients_mutex);
+                server_running = 0;
+                pthread_mutex_unlock(&clients_mutex);
+                break; 
+            } else {
+                printf("[Control] Unknown command: %s. Type 'shutdown'.\n", input_buffer);
+            }
+        } else {
+            break; // EOF/error on stdin
+        }
+    }
+    return NULL;
+}
+
+
+// --- Main Program ---
+int main(int argc, char *argv[]) {
+    int server_fd;
+    socklen_t addrlen = sizeof(struct sockaddr_in);
+    struct sockaddr_in address;
+    int port;
+
+    // Argument Validation
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <port> <max_concurrent_clients>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    port = atoi(argv[1]);
+    max_concurrent_clients = atoi(argv[2]);
+
+    if (max_concurrent_clients <= 0) {
+        fprintf(stderr, "Error: max_concurrent_clients must be a positive integer.\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // 1. Dynamic Allocation for Client Sockets
+    client_sockets = (int *)malloc(max_concurrent_clients * sizeof(int));
+    if (client_sockets == NULL) {
+        perror("Failed to allocate memory for client sockets");
+        exit(EXIT_FAILURE);
+    }
+    printf("Allocated memory for %d clients.\n", max_concurrent_clients);
+
+
+    // 2. Setup Server Socket
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Socket creation failed");
+        free(client_sockets);
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt failed");
+        close(server_fd);
+        free(client_sockets);
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port); 
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        close(server_fd);
+        free(client_sockets);
+        exit(EXIT_FAILURE);
+    }
+
+    // Use max_concurrent_clients as the backlog limit for the listen queue
+    if (listen(server_fd, max_concurrent_clients) < 0) {
+        perror("Listen failed");
+        close(server_fd);
+        free(client_sockets);
+        exit(EXIT_FAILURE);
+    }
+
+    // 3. Set Non-Blocking Accept
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    if (flags == -1) { perror("F_GETFL failed"); close(server_fd); free(client_sockets); exit(EXIT_FAILURE); }
+    if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("F_SETFL O_NONBLOCK failed");
+        close(server_fd);
+        free(client_sockets);
+        exit(EXIT_FAILURE);
+    }
+    printf("Listening socket set to non-blocking mode.\n");
+    
+    // 4. Start Control Thread
+    pthread_t control_tid;
+    if (pthread_create(&control_tid, NULL, server_control_thread, NULL) != 0) {
+        perror("Failed to create control thread");
+        close(server_fd);
+        free(client_sockets);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server (Chat) listening on port %d with max concurrent clients set to %d...\n", port, max_concurrent_clients);
+
+    // 5. Main Accept Loop
+    while (server_running) {
+        int new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+
+        if (new_socket > 0) {
+            // Check against dynamic maximum
+            if (client_count >= max_concurrent_clients) {
+                printf("[Main] Connection refused: Max clients reached (%d/%d).\n", client_count, max_concurrent_clients);
+                const char *refuse_msg = "Server capacity reached. Try again later.\n";
+                send(new_socket, refuse_msg, strlen(refuse_msg), 0);
+                close(new_socket);
+                continue;
+            }
+            
+            printf("[Main] New connection accepted on socket %d\n", new_socket);
+
+            // Allocate memory to pass socket descriptor to the thread
+            int *new_sock = (int *)malloc(sizeof(int));
+            if (new_sock == NULL) {
+                perror("[Main] Failed to allocate memory for thread arg");
+                close(new_socket);
+                continue; 
+            }
+            *new_sock = new_socket;
+
+            pthread_t client_tid;
+            if (pthread_create(&client_tid, NULL, client_handler, (void *)new_sock) < 0) {
+                perror("[Main] Could not create client thread");
+                free(new_sock); 
+                close(new_socket);
+            }
+            pthread_detach(client_tid); // Detach to clean up resources automatically
+            
+        } else if (new_socket < 0) {
+            // Non-blocking error: No connections pending
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(100000); // Wait 100ms before checking again
+            } else {
+                // Real accept error
+                if (server_running) {
+                    perror("[Main] Accept failed unexpectedly");
+                }
+                break; 
+            }
+        }
+    }
+
+    // Graceful Shutdown
+    printf("\n[Main] Exiting main loop. Shutting down server...\n");
+    close(server_fd);
+    printf("[Main] Listener socket closed.\n");
+
+    // Joining the control thread
+    pthread_join(control_tid, NULL);
+    printf("[Main] Control thread joined.\n");
+    
+    // Free the dynamically allocated client list
+    if (client_sockets) {
+        free(client_sockets);
+        printf("[Main] Dynamically allocated client list freed.\n");
+    }
+
+    printf("Server shutdown complete. Goodbye!\n");
+    return 0;
+}

@@ -1,0 +1,460 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <signal.h>
+#include <errno.h>
+#include <stdint.h>
+#include <sys/select.h>
+#include <pthread.h>
+
+#define MAX_MSG_SIZE 1024
+#define MAX_CLIENTS 100 
+#define TYPE_REGULAR 0
+#define TYPE_END_EXECUTION 1
+
+// --- Data Structures for Message Queue ---
+
+typedef struct message_node {
+    char buffer[MAX_MSG_SIZE]; // Fully constructed broadcast message
+    size_t len;
+    struct message_node *next;
+} message_node_t;
+
+message_node_t *queue_head = NULL;
+message_node_t *queue_tail = NULL;
+
+// --- Data Structures for Clients ---
+
+typedef struct {
+    int fd;
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+} client_t;
+
+client_t clients[MAX_CLIENTS];
+int num_clients = 0;
+int expected_clients = 0;
+int finished_clients_count = 0; // Guarded by client_list_lock
+
+// --- Synchronization Primitives ---
+
+pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t client_list_lock = PTHREAD_MUTEX_INITIALIZER;
+volatile int server_running = 1;
+
+
+// --- Function Prototypes ---
+void error(const char *msg);
+void enqueue_message(const char *buffer, size_t len);
+message_node_t *dequeue_message();
+void *broadcast_worker(void *arg);
+int handle_message(int sender_fd, char *buffer, ssize_t len, int listen_fd);
+void remove_client(int fd);
+
+
+/**
+ * @brief Utility function to print error message and exit.
+ */
+void error(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+// --- Queue Operations (Thread-Safe) ---
+
+/**
+ * @brief Adds a message to the broadcast queue.
+ */
+void enqueue_message(const char *buffer, size_t len) {
+    message_node_t *new_node = (message_node_t *)malloc(sizeof(message_node_t));
+    if (!new_node) {
+        perror("malloc failed for message node");
+        return;
+    }
+    memcpy(new_node->buffer, buffer, len);
+    new_node->len = len;
+    new_node->next = NULL;
+
+    pthread_mutex_lock(&queue_lock);
+    if (queue_tail == NULL) {
+        queue_head = new_node;
+        queue_tail = new_node;
+    } else {
+        queue_tail->next = new_node;
+        queue_tail = new_node;
+    }
+    
+    // Signal the broadcast worker that a new message is ready
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_lock);
+}
+
+/**
+ * @brief Retrieves a message from the broadcast queue.
+ */
+message_node_t *dequeue_message() {
+    pthread_mutex_lock(&queue_lock);
+    
+    // Wait until queue is not empty or server is shutting down
+    while (queue_head == NULL && server_running) {
+        pthread_cond_wait(&queue_cond, &queue_lock);
+    }
+    
+    if (queue_head == NULL) {
+        pthread_mutex_unlock(&queue_lock);
+        return NULL; // Shutdown signal received
+    }
+    
+    message_node_t *node = queue_head;
+    queue_head = queue_head->next;
+    if (queue_head == NULL) {
+        queue_tail = NULL;
+    }
+    
+    pthread_mutex_unlock(&queue_lock);
+    return node;
+}
+
+// --- Client Management ---
+
+/**
+ * @brief Removes a client from the tracking array. (Protected by client_list_lock)
+ */
+void remove_client(int fd) {
+    pthread_mutex_lock(&client_list_lock);
+    for (int i = 0; i < num_clients; i++) {
+        if (clients[i].fd == fd) {
+            close(fd);
+            // Move last client into the freed slot and decrease count
+            if (i < num_clients - 1) {
+                clients[i] = clients[num_clients - 1];
+            }
+            num_clients--;
+            printf("Client disconnected (FD %d). Current clients: %d\n", fd, num_clients);
+            pthread_mutex_unlock(&client_list_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&client_list_lock);
+}
+
+/**
+ * @brief Worker thread that dequeues messages and sends them to all clients.
+ * This thread enforces strict message ordering.
+ */
+void *broadcast_worker(void *arg) {
+    message_node_t *node;
+
+    while (server_running) {
+        node = dequeue_message();
+        
+        if (node == NULL) {
+            if (!server_running) break;
+            continue;
+        }
+
+        // --- Broadcast Message (Type 0 or Type 1) ---
+        
+        pthread_mutex_lock(&client_list_lock);
+        
+        // If it's a Type 1 message (termination commit)
+        if ((uint8_t)node->buffer[0] == TYPE_END_EXECUTION) {
+            printf("Broadcast Worker: Sending Phase 2 commit to all clients.\n");
+        }
+
+        for (int i = 0; i < num_clients; i++) {
+            // Use write() as requested
+            if (write(clients[i].fd, node->buffer, node->len) == -1) {
+                perror("Broadcast Worker: Error writing broadcast message");
+                // Note: If write fails, the client may have disconnected.
+                // The I/O thread will detect and handle the official disconnect.
+            }
+        }
+        
+        pthread_mutex_unlock(&client_list_lock);
+        
+        free(node);
+    }
+    printf("Broadcast Worker thread exiting.\n");
+    return NULL;
+}
+
+/**
+ * @brief Reads a full message (up to '\n') from a socket, processes it, and enqueues the broadcast payload.
+ * @return >0 if message was processed, 0 if incomplete, -1 on error/disconnect, -2 on server shutdown.
+ */
+int handle_message(int sender_fd, char *buffer, ssize_t len, int listen_fd) {
+    if (len <= 0) {
+        return -1;
+    }
+
+    // Check for a full message ending with '\n'
+    char *newline_pos = memchr(buffer, '\n', len);
+    if (!newline_pos) {
+        return 0; // Incomplete message
+    }
+
+    size_t msg_len = newline_pos - buffer + 1; // Length including '\n'
+    uint8_t type = (uint8_t)buffer[0];
+
+    if (type == TYPE_REGULAR) {
+        // --- Type 0: Regular Group Chat Message ---
+        
+        struct sockaddr_in sender_addr;
+        socklen_t addr_len = sizeof(sender_addr);
+        if (getpeername(sender_fd, (struct sockaddr*)&sender_addr, &addr_len) == -1) {
+            perror("getpeername failed");
+            return 0;
+        }
+        
+        uint32_t ip_nbo = sender_addr.sin_addr.s_addr;
+        uint16_t port_nbo = sender_addr.sin_port;
+        
+        // Broadcast message format: [Type 0 (1B) | IP (4B) | Port (2B) | Client Data | '\n']
+        char broadcast_buffer[MAX_MSG_SIZE];
+        
+        // Check size constraint (Client message + 6 bytes of server header)
+        if (msg_len + 6 > MAX_MSG_SIZE) {
+            fprintf(stderr, "Message too long to broadcast. Dropping.\n");
+        } else {
+            // Build the broadcast message buffer
+            broadcast_buffer[0] = TYPE_REGULAR;
+            memcpy(broadcast_buffer + 1, &ip_nbo, sizeof(ip_nbo));
+            memcpy(broadcast_buffer + 1 + sizeof(ip_nbo), &port_nbo, sizeof(port_nbo));
+            // Copy the client's payload (the original message starting from byte 1 up to '\n')
+            memcpy(broadcast_buffer + 7, buffer + 1, msg_len - 1);
+            
+            size_t broadcast_len = msg_len + 6; 
+            
+            // Enqueue the message for the broadcast worker
+            enqueue_message(broadcast_buffer, broadcast_len);
+        }
+        
+    } else if (type == TYPE_END_EXECUTION) {
+        // --- Type 1: Termination Signal (Phase 1) ---
+        
+        pthread_mutex_lock(&client_list_lock);
+        finished_clients_count++;
+        printf("Received Phase 1 signal from FD %d. Count: %d/%d\n", sender_fd, finished_clients_count, expected_clients);
+        
+        if (finished_clients_count == expected_clients) {
+            // --- Phase 2: Commit ---
+            printf("All expected clients finished. Starting Two-Phase Commit (Phase 2).\n");
+            
+            // Construct and enqueue Type 1 message
+            char commit_msg[] = {TYPE_END_EXECUTION, '\n'};
+            enqueue_message(commit_msg, sizeof(commit_msg));
+            
+            // Set server_running to 0 and signal the worker one last time to exit after sending Phase 2
+            server_running = 0;
+            pthread_cond_signal(&queue_cond); // Wake up worker to send commit/exit
+            
+            // The worker thread will handle the broadcast and then the main thread will cleanup
+            pthread_mutex_unlock(&client_list_lock);
+            return -2; // Special code for I/O thread to start cleanup
+        }
+        pthread_mutex_unlock(&client_list_lock);
+    } else {
+        fprintf(stderr, "Received unknown message type: %u. Discarding message.\n", type);
+    }
+    
+    // Shift the remaining data in the buffer (if any) to the start
+    if (len > msg_len) {
+        memmove(buffer, buffer + msg_len, len - msg_len);
+    }
+    
+    return msg_len;
+}
+
+void cleanup_and_exit(int server_fd, pthread_t worker_tid) {
+    
+    // 1. Wait for the broadcast worker to finish
+    if (worker_tid != 0) {
+        pthread_join(worker_tid, NULL);
+    }
+
+    // 2. Close all client connections
+    pthread_mutex_lock(&client_list_lock);
+    for (int i = 0; i < num_clients; i++) {
+        close(clients[i].fd);
+    }
+    pthread_mutex_unlock(&client_list_lock);
+
+    // 3. Close listener socket
+    if (server_fd != -1) {
+        close(server_fd);
+    }
+
+    // 4. Clean up queue nodes (though should be empty)
+    message_node_t *current = queue_head;
+    while (current != NULL) {
+        message_node_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    printf("Server shutting down gracefully.\n");
+    exit(EXIT_SUCCESS);
+}
+
+
+int main(int argc, char *argv[]) {
+    int listen_fd, max_fd, new_fd;
+    struct sockaddr_in serv_addr, cli_addr;
+    socklen_t clilen;
+    pthread_t worker_tid;
+    
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <port number> <# of clients>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+    
+    int port = atoi(argv[1]);
+    expected_clients = atoi(argv[2]);
+    
+    // 1. Create socket
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        error("ERROR opening socket");
+    }
+    
+    int opt = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+        perror("setsockopt");
+    }
+
+    // 2. Initialize and bind socket
+    memset((char *) &serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = INADDR_ANY; 
+    serv_addr.sin_port = htons(port);
+    
+    if (bind(listen_fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+        error("ERROR on binding");
+    }
+    
+    // 3. Listen
+    if (listen(listen_fd, 5) < 0) {
+        error("ERROR on listen");
+    }
+    
+    printf("Server listening on port %d, expecting %d clients...\n", port, expected_clients);
+
+    // 4. Start the dedicated Broadcast Worker thread
+    if (pthread_create(&worker_tid, NULL, broadcast_worker, NULL) != 0) {
+        error("ERROR creating broadcast worker thread");
+    }
+
+    // Main I/O thread loop using select()
+    char client_buffers[MAX_CLIENTS][MAX_MSG_SIZE];
+    ssize_t client_data_len[MAX_CLIENTS] = {0}; 
+
+    while (server_running) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        
+        FD_SET(listen_fd, &read_fds);
+        max_fd = listen_fd;
+        
+        pthread_mutex_lock(&client_list_lock);
+        for (int i = 0; i < num_clients; i++) {
+            FD_SET(clients[i].fd, &read_fds);
+            if (clients[i].fd > max_fd) {
+                max_fd = clients[i].fd;
+            }
+        }
+        pthread_mutex_unlock(&client_list_lock);
+
+
+        // Wait up to 1 second to check server_running flag
+        struct timeval timeout = {1, 0}; 
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+        
+        if (activity < 0) {
+            if (errno == EINTR) continue;
+            perror("select error");
+            break;
+        }
+
+        if (activity == 0) {
+            continue;
+        }
+        
+        // 5. Handle new connection attempts
+        if (FD_ISSET(listen_fd, &read_fds)) {
+            clilen = sizeof(cli_addr);
+            new_fd = accept(listen_fd, (struct sockaddr *) &cli_addr, &clilen);
+            if (new_fd < 0) {
+                perror("accept error");
+            } else {
+                pthread_mutex_lock(&client_list_lock);
+                if (num_clients < MAX_CLIENTS) {
+                    clients[num_clients].fd = new_fd;
+                    clients[num_clients].addr = cli_addr;
+                    clients[num_clients].addr_len = clilen;
+                    
+                    client_data_len[num_clients] = 0;
+                    
+                    printf("New connection from %s:%d on FD %d. Clients: %d\n",
+                           inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port),
+                           new_fd, num_clients + 1);
+                           
+                    num_clients++;
+                } else {
+                    fprintf(stderr, "Connection rejected: Max clients reached.\n");
+                    close(new_fd);
+                }
+                pthread_mutex_unlock(&client_list_lock);
+            }
+        }
+        
+        // 6. Handle data from existing clients
+        pthread_mutex_lock(&client_list_lock);
+        for (int i = 0; i < num_clients; i++) {
+            int client_fd = clients[i].fd;
+            if (FD_ISSET(client_fd, &read_fds)) {
+                
+                ssize_t bytes_read = read(client_fd, 
+                                          client_buffers[i] + client_data_len[i], 
+                                          MAX_MSG_SIZE - client_data_len[i]);
+                                          
+                if (bytes_read <= 0) {
+                    // Disconnect or error: must be handled outside the locked loop
+                    int disconnected_fd = client_fd;
+                    pthread_mutex_unlock(&client_list_lock);
+                    remove_client(disconnected_fd);
+                    pthread_mutex_lock(&client_list_lock);
+                    i--; // Correct index after removal
+                    continue;
+                }
+                
+                client_data_len[i] += bytes_read;
+
+                // Process all full messages that arrived in the buffer
+                int process_result = 0;
+                while ((process_result = handle_message(client_fd, client_buffers[i], client_data_len[i], listen_fd)) > 0) {
+                    client_data_len[i] -= process_result;
+                }
+                
+                if (process_result == -2) {
+                    // Server termination signal received (Phase 2 completed)
+                    pthread_mutex_unlock(&client_list_lock);
+                    cleanup_and_exit(listen_fd, worker_tid);
+                } else if (process_result == -1) {
+                    // Client disconnect during message handling (should be handled by bytes_read <= 0)
+                }
+            }
+        }
+        pthread_mutex_unlock(&client_list_lock);
+    }
+
+    // Should only be reached if loop breaks early (error)
+    cleanup_and_exit(listen_fd, worker_tid);
+    return 0;
+}

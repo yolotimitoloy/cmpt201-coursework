@@ -1,0 +1,351 @@
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define MAX_MSG_SIZE 1024
+#define MAX_CLIENTS 100 // Based on requirement
+#define TYPE_REGULAR 0
+#define TYPE_END_EXECUTION 1
+
+// Structure to hold connected client information
+typedef struct {
+  int fd;
+  struct sockaddr_in addr;
+  socklen_t addr_len;
+} client_t;
+
+client_t clients[MAX_CLIENTS];
+int num_clients = 0;
+int expected_clients = 0;
+int finished_clients_count = 0;
+
+// Mutex (not strictly needed with select but good for complex sync) or just use
+// simple flags/counters protected by the main thread's sequential execution.
+
+// Function Prototypes
+void error(const char *msg);
+int handle_message(int sender_fd, char *buffer, ssize_t len);
+void broadcast(const char *message, size_t len, int original_sender_fd);
+void cleanup_and_exit(int server_fd);
+void remove_client(int fd);
+ssize_t write_all(int client_fd,const void* message_buffer,size_t message_len);
+/**
+ * @brief Utility function to print error message and exit.
+ */
+void error(const char *msg) {
+  perror(msg);
+  exit(EXIT_FAILURE);
+}
+
+/**
+ * @brief Removes a client from the tracking array.
+ */
+void remove_client(int fd) {
+  for (int i = 0; i < num_clients; i++) {
+    if (clients[i].fd == fd) {
+      close(fd);
+      // Move last client into the freed slot and decrease count
+      if (i < num_clients - 1) {
+        clients[i] = clients[num_clients - 1];
+      }
+      num_clients--;
+      printf("Client disconnected (FD %d). Current clients: %d\n", fd,
+             num_clients);
+      return;
+    }
+  }
+}
+
+ssize_t write_all(int fd, const void *buf, size_t len) {
+    size_t total_written = 0;
+    const char *ptr = buf;
+
+    while (total_written < len) {
+        ssize_t n = write(fd, ptr + total_written, len - total_written);
+        if (n < 0) {
+            if (errno == EINTR) continue;   // retry
+            return -1;                      // fatal
+        }
+        if (n == 0) {
+            return -1;                      // connection closed
+        }
+        total_written += n;
+    }
+
+    return total_written;
+}
+
+
+/**
+ * @brief Broadcasts a message to all connected clients.
+ * Message is already formatted by handle_message with Type 0, IP, and Port.
+ */
+void broadcast(const char *message, size_t len, int original_sender_fd) {
+  for (int i = 0; i < num_clients; i++) {
+    // Send to all clients, including the sender
+    if (write_all(clients[i].fd, message, len) == -1) {
+      perror("Error sending broadcast message");
+      // Non-fatal, just log and continue
+    }
+  }
+}
+
+/**
+ * @brief Reads a full message (up to '\n') from a socket, and processes it.
+ * @return 1 if message was processed, 0 if no message or ongoing, -1 on
+ * error/disconnect.
+ */
+int handle_message(int sender_fd, char *buffer, ssize_t len) {
+  if (len <= 0) {
+    // Disconnect or error
+    return -1;
+  }
+
+  // A message is defined as ending with '\n'. Check if we have a full message.
+  char *newline_pos = memchr(buffer, '\n', len);
+  if (!newline_pos) {
+    // Incomplete message, need more data (simplification: assume we get a full
+    // message block)
+    return 0;
+  }
+
+  size_t msg_len = newline_pos - buffer + 1; // Length including '\n'
+
+  // 1. Read Type
+  uint8_t type = (uint8_t)buffer[0];
+
+  if (type == TYPE_REGULAR) {
+    // --- Type 0: Regular Group Chat Message ---
+
+    // Find the sender's address details
+    struct sockaddr_in sender_addr;
+    socklen_t addr_len = sizeof(sender_addr);
+    if (getpeername(sender_fd, (struct sockaddr *)&sender_addr, &addr_len) ==
+        -1) {
+      perror("getpeername failed");
+      return 0;
+    }
+
+    // Extract IP and Port (in Network Byte Order)
+    uint32_t ip_nbo = sender_addr.sin_addr.s_addr;
+    uint16_t port_nbo = sender_addr.sin_port;
+
+    // The original client message data is (msg_len - 1) bytes long.
+    // Broadcast message format: [Type 0 (1B) | IP (4B) | Port (2B) | Client
+    // Data (msg_len - 1B)]
+
+    char broadcast_buffer[MAX_MSG_SIZE];
+    if (msg_len + 6 > MAX_MSG_SIZE) {
+      fprintf(stderr, "Message too long to broadcast.\n");
+      return 0; // Drop message
+    }
+
+    // Build the broadcast message buffer
+    broadcast_buffer[0] = TYPE_REGULAR;
+    memcpy(broadcast_buffer + 1, &ip_nbo, sizeof(ip_nbo));
+    memcpy(broadcast_buffer + 1 + sizeof(ip_nbo), &port_nbo, sizeof(port_nbo));
+    // Copy the client's payload (the original message without its leading type
+    // byte)
+    memcpy(broadcast_buffer + 7, buffer + 1, msg_len - 1);
+
+    // Total length of the broadcast message
+    size_t broadcast_len = msg_len + 6;
+
+    broadcast(broadcast_buffer, broadcast_len, sender_fd);
+
+  } else if (type == TYPE_END_EXECUTION) {
+    // --- Type 1: Termination Signal (Phase 1) ---
+    printf("Received Phase 1 signal from FD %d\n", sender_fd);
+    finished_clients_count++;
+
+    if (finished_clients_count == expected_clients) {
+      // --- Phase 2: Commit ---
+      printf("All expected clients finished. Starting Two-Phase Commit (Phase "
+             "2).\n");
+
+      // Send Type 1 message to ALL clients
+      char commit_msg[] = {TYPE_END_EXECUTION, '\n'};
+      broadcast(commit_msg, sizeof(commit_msg), -1);
+
+      // Signal main loop to exit
+      return -2; // Special code for server termination
+    }
+  } else {
+    fprintf(stderr, "Received unknown message type: %u\n", type);
+  }
+
+  // Shift the remaining data in the buffer (if any) to the start
+  if (len > msg_len) {
+    memmove(buffer, buffer + msg_len, len - msg_len);
+  }
+
+  return msg_len;
+}
+
+void cleanup_and_exit(int server_fd) {
+  for (int i = 0; i < num_clients; i++) {
+    close(clients[i].fd);
+  }
+  if (server_fd != -1) {
+    close(server_fd);
+  }
+  printf("Server shutting down.\n");
+  exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char *argv[]) {
+  int listen_fd, max_fd, new_fd;
+  struct sockaddr_in serv_addr, cli_addr;
+  socklen_t clilen;
+
+  // Command line argument check
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <port number> <# of clients>\n", argv[0]);
+    exit(EXIT_FAILURE);
+  }
+
+  int port = atoi(argv[1]);
+  expected_clients = atoi(argv[2]);
+
+  if (expected_clients <= 0 || expected_clients > MAX_CLIENTS) {
+    fprintf(stderr, "Invalid number of clients: %d (Max %d)\n",
+            expected_clients, MAX_CLIENTS);
+    exit(EXIT_FAILURE);
+  }
+
+  // 1. Create socket
+  listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0) {
+    error("ERROR opening socket");
+  }
+
+  // Set SO_REUSEADDR to allow socket to be immediately reusable
+  int opt = 1;
+  if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
+      -1) {
+    perror("setsockopt");
+  }
+
+  // 2. Initialize and bind socket
+  memset((char *)&serv_addr, 0, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  // Bind to all available IP addresses
+  serv_addr.sin_addr.s_addr = INADDR_ANY;
+  serv_addr.sin_port = htons(port);
+
+  if (bind(listen_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    error("ERROR on binding");
+  }
+
+  // 3. Listen
+  if (listen(listen_fd, 5) < 0) {
+    error("ERROR on listen");
+  }
+
+  printf("Server listening on port %d, expecting %d clients...\n", port,
+         expected_clients);
+
+  // Main server loop using select()
+  char client_buffers[MAX_CLIENTS][MAX_MSG_SIZE];
+  ssize_t client_data_len[MAX_CLIENTS] = {
+      0}; // Bytes currently stored in buffer
+
+  while (1) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+
+    // Add listener socket
+    FD_SET(listen_fd, &read_fds);
+    max_fd = listen_fd;
+
+    // Add client sockets
+    for (int i = 0; i < num_clients; i++) {
+      FD_SET(clients[i].fd, &read_fds);
+      if (clients[i].fd > max_fd) {
+        max_fd = clients[i].fd;
+      }
+    }
+
+    // Wait for an activity on one of the sockets
+    int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+
+    if ((activity < 0) && (errno != EINTR)) {
+      perror("select error");
+      continue;
+    }
+
+    // 4. Handle new connection attempts
+    if (FD_ISSET(listen_fd, &read_fds)) {
+      clilen = sizeof(cli_addr);
+      new_fd = accept(listen_fd, (struct sockaddr *)&cli_addr, &clilen);
+      if (new_fd < 0) {
+        perror("accept error");
+      } else {
+        if (num_clients < MAX_CLIENTS) {
+          clients[num_clients].fd = new_fd;
+          clients[num_clients].addr = cli_addr;
+          clients[num_clients].addr_len = clilen;
+
+          // Clear the new client's buffer
+          client_data_len[num_clients] = 0;
+
+          printf("New connection from %s:%d on FD %d. Clients: %d\n",
+                 inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), new_fd,
+                 num_clients + 1);
+
+          num_clients++;
+        } else {
+          // Reject connection
+          fprintf(stderr, "Connection rejected: Max clients reached.\n");
+          close(new_fd);
+        }
+      }
+    }
+
+    // 5. Handle data from existing clients
+    for (int i = 0; i < num_clients; i++) {
+      int client_fd = clients[i].fd;
+      if (FD_ISSET(client_fd, &read_fds)) {
+
+        // Read up to the remaining buffer size
+        // Modified: using read
+        ssize_t bytes_read =
+            read(client_fd, client_buffers[i] + client_data_len[i],
+                 MAX_MSG_SIZE - client_data_len[i]);
+        if (bytes_read <= 0) {
+          // Disconnect or error
+          remove_client(client_fd);
+          i--; // Decrement index since the last client moved into this spot
+          continue;
+        }
+
+        client_data_len[i] += bytes_read;
+
+        // Process all full messages that arrived in the buffer
+        int process_result = 0;
+        while ((process_result = handle_message(client_fd, client_buffers[i],
+                                                client_data_len[i])) > 0) {
+          client_data_len[i] -= process_result;
+        }
+
+        if (process_result == -2) {
+          // Server termination signal received (Phase 2 completed)
+          cleanup_and_exit(listen_fd);
+        } else if (process_result == -1) {
+          // Client disconnect during message handling
+          remove_client(client_fd);
+          i--; // Decrement index
+        }
+      }
+    }
+  }
+}
