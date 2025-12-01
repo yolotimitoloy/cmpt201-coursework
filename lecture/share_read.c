@@ -1,0 +1,54 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[]) {
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s <shared_memory_name>\n", argv[0]);
+    fprintf(stderr, "Example: %s /my_shared_memory\n", argv[0]);
+    exit(EXIT_FAILURE);
+  }
+
+  const char *shm_name = argv[1];
+
+  printf("Reader: Waiting for shared memory object '%s' to be created...\n",
+         shm_name);
+
+  // Open the existing shared memory object
+  int fd = shm_open(shm_name, O_RDONLY, S_IRUSR);
+  if (fd == -1) {
+    perror("shm_open");
+    exit(EXIT_FAILURE);
+  }
+
+  // Map the shared memory object into the address space
+  int *shared_data = mmap(NULL, sizeof(int), PROT_READ, MAP_SHARED, fd, 0);
+  if (shared_data == MAP_FAILED) {
+    perror("mmap");
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+
+  // Read the integer from shared memory
+  int value_read = *shared_data;
+
+  printf("Reader: Read integer %d from shared memory '%s'\n", value_read,
+         shm_name);
+
+  getchar();
+
+  // Clean up
+  if (munmap(shared_data, sizeof(int)) == -1) {
+    perror("munmap");
+  }
+
+  close(fd);
+
+  printf("Reader: Finished reading from shared memory\n");
+  return EXIT_SUCCESS;
+}

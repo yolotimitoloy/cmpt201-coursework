@@ -1,0 +1,35 @@
+#define _DEFAULT_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[]) {
+  if (argc != 3) {
+    fprintf(stderr, "Usage: %s shm_name number\n", argv[0]);
+    exit(EXIT_FAILURE);
+  }
+
+  int number = atoi(argv[2]);
+
+  int shm_fd = shm_open(argv[1], O_CREAT | O_RDWR, 0666);
+  ftruncate(shm_fd, sizeof(int));
+
+  int *addr =
+      mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+  if (addr == MAP_FAILED) {
+    perror("mmap");
+    exit(EXIT_FAILURE);
+  }
+
+  *addr = number;
+
+  getchar();
+
+  munmap(addr, sizeof(int));
+  close(shm_fd);
+  shm_unlink(argv[1]);
+  exit(EXIT_SUCCESS);
+}
